@@ -1,0 +1,21 @@
+{
+  "name": "miniayudas",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "python3 src/server.py",
+    "dev": "python3 src/server.py"
+  },
+  "dependencies": {
+    "@babel/standalone": "^7.28.4",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "mssql": "^11.0.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
