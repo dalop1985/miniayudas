@@ -1,4 +1,6 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
 python-dotenv==1.1.0
-python-tds==1.16.0
+pyodbc>=5.0.0
+orjson>=3.9.0
+openpyxl>=3.1.2

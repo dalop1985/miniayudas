@@ -4,8 +4,8 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "start": "python3 src/server.py",
-    "dev": "python3 src/server.py"
+    "start": "python src/server.py",
+    "dev": "python src/server.py"
   },
   "dependencies": {
     "@babel/standalone": "^7.28.4",
