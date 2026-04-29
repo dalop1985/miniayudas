@@ -7511,18 +7511,24 @@ def _fetch_predio_alpredio(cve_fte_mt: str, predio_id: Optional[int], clave_cata
       SELECT TOP 1
         p.CveFteMT,
         CAST(p.PredioId AS int) AS PredioId,
-        RTRIM(COALESCE(p.PredioCveCatastral COLLATE DATABASE_DEFAULT, '')) AS PredioCveCatastral,
-        RTRIM(COALESCE(p.PredioClavePredial COLLATE DATABASE_DEFAULT, '')) AS PredioClavePredial,
+        RTRIM(COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '')) AS PredioCveCatastral,
+        RTRIM(COALESCE(CONVERT(varchar(80), p.PredioClavePredial) COLLATE DATABASE_DEFAULT, '')) AS PredioClavePredial,
         p.PredioAltaFecha,
-        RTRIM(COALESCE(p.PredioStatus COLLATE DATABASE_DEFAULT, '')) AS PredioStatus,
-        RTRIM(COALESCE(p.PredioTipo COLLATE DATABASE_DEFAULT, '')) AS PredioTipo,
-        RTRIM(COALESCE(p.PredioCalle COLLATE DATABASE_DEFAULT, '')) AS PredioCalle,
-        RTRIM(COALESCE(p.PredioNumExt COLLATE DATABASE_DEFAULT, '')) AS PredioNumExt,
-        RTRIM(COALESCE(p.PredioNumInt COLLATE DATABASE_DEFAULT, '')) AS PredioNumInt,
-        RTRIM(COALESCE(p.PredioCodigoPostal COLLATE DATABASE_DEFAULT, '')) AS PredioCodigoPostal,
-        RTRIM(COALESCE(p.CatastroDatosEscriturales COLLATE DATABASE_DEFAULT, '')) AS CatastroDatosEscriturales,
-        RTRIM(COALESCE(per.NombreCompletoPersona COLLATE DATABASE_DEFAULT, per.RazonSocialPersona COLLATE DATABASE_DEFAULT, '')) AS PropietarioNombre,
-        RTRIM(COALESCE(per.RFCPersona COLLATE DATABASE_DEFAULT, '')) AS PropietarioRFC,
+        RTRIM(COALESCE(CONVERT(varchar(32), p.PredioStatus) COLLATE DATABASE_DEFAULT, '')) AS PredioStatus,
+        RTRIM(COALESCE(CONVERT(varchar(32), p.PredioTipo) COLLATE DATABASE_DEFAULT, '')) AS PredioTipo,
+        RTRIM(COALESCE(CONVERT(varchar(160), p.PredioCalle) COLLATE DATABASE_DEFAULT, '')) AS PredioCalle,
+        RTRIM(COALESCE(CONVERT(varchar(32), p.PredioNumExt) COLLATE DATABASE_DEFAULT, '')) AS PredioNumExt,
+        RTRIM(COALESCE(CONVERT(varchar(32), p.PredioNumInt) COLLATE DATABASE_DEFAULT, '')) AS PredioNumInt,
+        RTRIM(COALESCE(CONVERT(varchar(12), p.PredioCodigoPostal) COLLATE DATABASE_DEFAULT, '')) AS PredioCodigoPostal,
+        RTRIM(COALESCE(CONVERT(varchar(250), p.CatastroDatosEscriturales) COLLATE DATABASE_DEFAULT, '')) AS CatastroDatosEscriturales,
+        RTRIM(
+          COALESCE(
+            CONVERT(varchar(250), per.NombreCompletoPersona) COLLATE DATABASE_DEFAULT,
+            CONVERT(varchar(250), per.RazonSocialPersona) COLLATE DATABASE_DEFAULT,
+            ''
+          )
+        ) AS PropietarioNombre,
+        RTRIM(COALESCE(CONVERT(varchar(32), per.RFCPersona) COLLATE DATABASE_DEFAULT, '')) AS PropietarioRFC,
         CAST(COALESCE(p.PredioTerrenoImporte, 0) AS decimal(18,2)) AS PredioTerrenoImporte,
         CAST(COALESCE(p.PredioConstruccionImporte, 0) AS decimal(18,2)) AS PredioConstruccionImporte,
         CAST(COALESCE(p.PredioCatastralImporte, 0) AS decimal(18,2)) AS PredioCatastralImporte,
@@ -7547,8 +7553,14 @@ def _fetch_predio_alpredio(cve_fte_mt: str, predio_id: Optional[int], clave_cata
         AND (@PredioId IS NULL OR p.PredioId = @PredioId)
         AND (
           @ClaveCatastral IS NULL OR
-          (@ClaveMode = 'exacto' AND RTRIM(COALESCE(p.PredioCveCatastral COLLATE DATABASE_DEFAULT, '')) = @ClaveCatastral) OR
-          (@ClaveMode <> 'exacto' AND p.PredioCveCatastral LIKE '%' + @ClaveCatastral + '%')
+          (
+            @ClaveMode = 'exacto'
+            AND RTRIM(COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '')) = @ClaveCatastral
+          )
+          OR (
+            @ClaveMode <> 'exacto'
+            AND COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '') LIKE '%' + @ClaveCatastral + '%'
+          )
         )
       ORDER BY p.PredioId ASC
       OPTION (RECOMPILE);
