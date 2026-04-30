@@ -573,11 +573,25 @@ def _csv_escape(value: Any) -> str:
  
  
 def _require_admin(x_admin_key: Optional[str]) -> None:
-  expected = os.getenv("ADMIN_KEY")
+  expected = str(os.getenv("ADMIN_KEY") or "").strip()
   if not expected:
     raise HTTPException(status_code=503, detail="ADMIN_KEY no configurada en el servidor")
-  if not x_admin_key or x_admin_key != expected:
+  provided = str(x_admin_key or "").strip()
+  if not provided or not secrets.compare_digest(provided, expected):
     raise HTTPException(status_code=401, detail="No autorizado")
+
+
+def _has_valid_admin_key(request: Request) -> bool:
+  expected = str(os.getenv("ADMIN_KEY") or "").strip()
+  if not expected:
+    return False
+  provided = str(request.headers.get("x-admin-key") or "").strip()
+  if not provided:
+    return False
+  try:
+    return secrets.compare_digest(provided, expected)
+  except Exception:
+    return False
  
 
 def _auth_secret() -> Optional[bytes]:
@@ -1047,6 +1061,9 @@ async def _auth_guard_api(request: Request, call_next):
   user = _get_current_user(request)
   if not user:
     return ORJSONResponse(status_code=401, content={"ok": False, "detail": "No autenticado"})
+
+  if path in {"/api/activaciones", "/api/consolidar"} and _has_valid_admin_key(request):
+    return await call_next(request)
 
   if not _role_allows_api_path(str(user.get("role") or ""), path):
     return ORJSONResponse(status_code=403, content={"ok": False, "detail": "No autorizado"})

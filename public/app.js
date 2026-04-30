@@ -89,6 +89,8 @@ function TableWithColumns({ rows, columns }) {
     "Subtotal",
     "Monto anual",
     "Cuota mensual"
+    ,
+    "Total pase"
   ]);
 
   const moneyFormat = new Intl.NumberFormat("es-MX", {
@@ -3040,7 +3042,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-admin-key": form.adminKey
+          "x-admin-key": String(form.adminKey || "").trim()
         },
         body: JSON.stringify(getPayload())
       });
@@ -3073,7 +3075,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          "x-admin-key": form.adminKey
+          "x-admin-key": String(form.adminKey || "").trim()
         },
         body: JSON.stringify({})
       });
@@ -3143,6 +3145,48 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
       nombre_concepto: c.nombre_concepto ?? ""
     }));
   }, [criCatalog]);
+
+  const factusRowsWithTotalPase = useMemo(() => {
+    if (!Array.isArray(factusRows) || factusRows.length === 0) return [];
+    const out = factusRows.map((r) => ({ ...(r || {}) }));
+
+    let currentStartIndex = -1;
+    let currentSum = 0;
+
+    function toNumber(value) {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string") {
+        const n = Number(value.replace(/,/g, "").trim());
+        if (Number.isFinite(n)) return n;
+      }
+      return 0;
+    }
+
+    function finalize() {
+      if (currentStartIndex >= 0) {
+        out[currentStartIndex]["Total pase"] = currentSum;
+      }
+      currentStartIndex = -1;
+      currentSum = 0;
+    }
+
+    for (let i = 0; i < out.length; i++) {
+      const row = out[i] || {};
+      const hasKey = String(row.Serie || "").trim() !== "" && String(row.Folio || "").trim() !== "";
+      if (hasKey) {
+        finalize();
+        currentStartIndex = i;
+      }
+      if (currentStartIndex < 0) {
+        currentStartIndex = i;
+      }
+      out[i]["Total pase"] = null;
+      currentSum += toNumber(row.Total);
+    }
+
+    finalize();
+    return out;
+  }, [factusRows]);
 
   useEffect(() => {
     if (!allowed.includes(section)) {
@@ -4162,7 +4206,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                   </div>
                 </div>
                 <TableWithColumns
-                  rows={factusRows}
+                  rows={factusRowsWithTotalPase}
                   columns={[
                     { key: "Serie", label: "Serie" },
                     { key: "Folio", label: "Folio" },
@@ -4171,7 +4215,8 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                     { key: "RFC", label: "RFC" },
                     { key: "Observaciones", label: "Observaciones" },
                     { key: "Concepto", label: "Concepto" },
-                    { key: "Total", label: "Total" }
+                    { key: "Total", label: "Total" },
+                    { key: "Total pase", label: "Total pase" }
                   ]}
                 />
               </section>
