@@ -39,6 +39,80 @@ RECARGOS_MORA_BY_YEAR: Dict[int, decimal.Decimal] = {}
 _RECARGOS_STORE_LOCK = threading.Lock()
 _RECARGOS_STORE_PATH = Path(os.getenv("RECARGOS_STORE_PATH") or (_INPC_STORE_DIR / "recargos_historico.json"))
 
+_UPLOAD_JSON_MAX_BYTES = int(os.getenv("UPLOAD_JSON_MAX_BYTES") or "1048576")
+
+_LOGIN_RATE_LOCK = threading.Lock()
+_LOGIN_RATE_BUCKETS: Dict[str, List[float]] = {}
+_LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_WINDOW_SECONDS") or "300")
+_LOGIN_RATE_MAX = int(os.getenv("LOGIN_RATE_MAX") or "20")
+
+
+def _client_ip(request: Request) -> str:
+  try:
+    xff = request.headers.get("x-forwarded-for") or ""
+    if xff:
+      return xff.split(",")[0].strip() or "unknown"
+    if request.client and request.client.host:
+      return str(request.client.host)
+  except Exception:
+    pass
+  return "unknown"
+
+
+def _is_secure_request(request: Request) -> bool:
+  try:
+    xf_proto = (request.headers.get("x-forwarded-proto") or "").strip().lower()
+    if xf_proto == "https":
+      return True
+    if xf_proto == "http":
+      return False
+  except Exception:
+    pass
+  return (request.url.scheme == "https")
+
+
+def _reject_if_too_large(request: Request, max_bytes: int) -> None:
+  try:
+    raw = request.headers.get("content-length")
+    if raw is None:
+      return
+    n = int(str(raw).strip())
+    if n > int(max_bytes):
+      raise HTTPException(status_code=413, detail="Contenido demasiado grande")
+  except HTTPException:
+    raise
+  except Exception:
+    return
+
+
+def _check_login_rate_limit(request: Request) -> None:
+  ip = _client_ip(request)
+  now = datetime.utcnow().timestamp()
+  with _LOGIN_RATE_LOCK:
+    bucket = _LOGIN_RATE_BUCKETS.get(ip)
+    if not bucket:
+      bucket = []
+      _LOGIN_RATE_BUCKETS[ip] = bucket
+    cutoff = now - float(_LOGIN_RATE_WINDOW_SECONDS)
+    while bucket and bucket[0] < cutoff:
+      bucket.pop(0)
+    if len(bucket) >= int(_LOGIN_RATE_MAX):
+      raise HTTPException(status_code=429, detail="Demasiados intentos, espera unos minutos")
+    bucket.append(now)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+  resp = await call_next(request)
+  try:
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+  except Exception:
+    pass
+  return resp
+
 
 def _load_umas_from_disk() -> None:
   try:
@@ -491,6 +565,42 @@ def _ensure_auth_schema_microservicios() -> None:
     """
   )
 
+  ddl.append(
+    """
+    IF OBJECT_ID('dbo.AppLocks', 'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.AppLocks (
+        LockKey       NVARCHAR(200) NOT NULL CONSTRAINT PK_AppLocks PRIMARY KEY,
+        OwnerUserId   INT NULL,
+        OwnerUsername NVARCHAR(120) NULL,
+        AcquiredAt    DATETIME2(0) NOT NULL CONSTRAINT DF_AppLocks_AcquiredAt DEFAULT (SYSUTCDATETIME()),
+        ExpiresAt     DATETIME2(0) NOT NULL,
+        UpdatedAt     DATETIME2(0) NOT NULL CONSTRAINT DF_AppLocks_UpdatedAt DEFAULT (SYSUTCDATETIME())
+      );
+      CREATE INDEX IX_AppLocks_ExpiresAt ON dbo.AppLocks(ExpiresAt);
+    END
+    """
+  )
+
+  ddl.append(
+    """
+    IF OBJECT_ID('dbo.AppIdempotency', 'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.AppIdempotency (
+        IdempotencyKey NVARCHAR(80) NOT NULL,
+        Path           NVARCHAR(200) NOT NULL,
+        UserId         INT NULL,
+        CreatedAt      DATETIME2(0) NOT NULL CONSTRAINT DF_AppIdempotency_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        RequestHash    VARBINARY(32) NULL,
+        StatusCode     INT NOT NULL,
+        ResponseJson   NVARCHAR(MAX) NOT NULL,
+        CONSTRAINT PK_AppIdempotency PRIMARY KEY (IdempotencyKey, Path, UserId)
+      );
+      CREATE INDEX IX_AppIdempotency_CreatedAt ON dbo.AppIdempotency(CreatedAt);
+    END
+    """
+  )
+
   conn = get_conn_for_database("MicroServicios")
   try:
     cur = conn.cursor()
@@ -518,6 +628,165 @@ def _audit_auth_event(event: str, username: Optional[str], user_id: Optional[int
         VALUES (?, ?, ?, ?, ?, ?);
         """,
         (str(event)[:50], (str(username)[:120] if username else None), user_id, ip, (str(ua)[:512] if ua else None), (str(detail)[:400] if detail else None)),
+      )
+      conn.commit()
+  except Exception:
+    return
+
+
+def _lock_key(*parts: Any) -> str:
+  return ":".join([str(p) for p in parts if p is not None])[:200]
+
+
+def _acquire_lock(lock_key: str, user: Dict[str, Any], ttl_seconds: int) -> Dict[str, Any]:
+  _ensure_auth_schema_microservicios()
+  owner_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+  owner_username = str(user.get("username") or "")[:120] or None
+  ttl = int(ttl_seconds) if int(ttl_seconds) > 0 else 60
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    cur.execute(
+      """
+      UPDATE dbo.AppLocks
+      SET
+        OwnerUserId = ?,
+        OwnerUsername = ?,
+        AcquiredAt = SYSUTCDATETIME(),
+        ExpiresAt = DATEADD(SECOND, ?, SYSUTCDATETIME()),
+        UpdatedAt = SYSUTCDATETIME()
+      WHERE LockKey = ?
+        AND ExpiresAt <= SYSUTCDATETIME();
+      """,
+      (owner_id, owner_username, ttl, lock_key),
+    )
+    if int(cur.rowcount or 0) > 0:
+      conn.commit()
+      return {"lockKey": lock_key, "ownerUserId": owner_id, "ownerUsername": owner_username, "ttlSeconds": ttl}
+
+    try:
+      cur.execute(
+        """
+        INSERT INTO dbo.AppLocks (LockKey, OwnerUserId, OwnerUsername, ExpiresAt)
+        VALUES (?, ?, ?, DATEADD(SECOND, ?, SYSUTCDATETIME()));
+        """,
+        (lock_key, owner_id, owner_username, ttl),
+      )
+      conn.commit()
+      return {"lockKey": lock_key, "ownerUserId": owner_id, "ownerUsername": owner_username, "ttlSeconds": ttl}
+    except Exception:
+      try:
+        conn.rollback()
+      except Exception:
+        pass
+
+    cur.execute(
+      """
+      SELECT TOP 1
+        LockKey AS lockKey,
+        OwnerUserId AS ownerUserId,
+        OwnerUsername AS ownerUsername,
+        ExpiresAt AS expiresAt
+      FROM dbo.AppLocks
+      WHERE LockKey = ?;
+      """,
+      (lock_key,),
+    )
+    rows = _rows(cur)
+    info = rows[0] if rows else {"lockKey": lock_key}
+    raise HTTPException(status_code=409, detail={"code": "E_LOCKED", "message": "Trámite en proceso", "lock": info})
+
+
+def _release_lock(lock_key: str, user: Dict[str, Any]) -> None:
+  try:
+    _ensure_auth_schema_microservicios()
+    owner_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+    with get_conn_for_database("MicroServicios") as conn:
+      cur = conn.cursor()
+      cur.execute(
+        """
+        DELETE FROM dbo.AppLocks
+        WHERE LockKey = ?
+          AND (? IS NULL OR OwnerUserId = ?);
+        """,
+        (lock_key, owner_id, owner_id),
+      )
+      conn.commit()
+  except Exception:
+    return
+
+
+def _idempotency_lookup(request: Request, user: Dict[str, Any], body: Any) -> Optional[ORJSONResponse]:
+  key = (request.headers.get("Idempotency-Key") or "").strip()
+  if not key or len(key) > 80:
+    return None
+  _ensure_auth_schema_microservicios()
+  try:
+    raw = orjson.dumps(body or {}, option=orjson.OPT_SORT_KEYS)
+  except Exception:
+    raw = orjson.dumps({})
+  req_hash = _sha256_bytes(raw)
+  path = str(request.url.path or "")[:200]
+  user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT TOP 1 StatusCode, ResponseJson, RequestHash
+      FROM dbo.AppIdempotency
+      WHERE IdempotencyKey = ?
+        AND Path = ?
+        AND ((UserId IS NULL AND ? IS NULL) OR UserId = ?);
+      """,
+      (key, path, user_id, user_id),
+    )
+    rows = cur.fetchall()
+    if not rows:
+      return None
+    status_code = int(rows[0][0] or 200)
+    resp_json = str(rows[0][1] or "{}")
+    stored_hash = bytes(rows[0][2]) if rows[0][2] is not None else None
+    if stored_hash is not None and stored_hash != req_hash:
+      raise HTTPException(status_code=409, detail="Idempotency-Key ya fue usado con otro payload")
+    try:
+      payload = orjson.loads(resp_json.encode("utf-8"))
+    except Exception:
+      payload = {"ok": False, "error": "Respuesta idempotente inválida"}
+    return ORJSONResponse(status_code=status_code, content=payload)
+
+
+def _idempotency_store(request: Request, user: Dict[str, Any], body: Any, response: ORJSONResponse) -> None:
+  try:
+    key = (request.headers.get("Idempotency-Key") or "").strip()
+    if not key or len(key) > 80:
+      return
+    _ensure_auth_schema_microservicios()
+    try:
+      raw = orjson.dumps(body or {}, option=orjson.OPT_SORT_KEYS)
+    except Exception:
+      raw = orjson.dumps({})
+    req_hash = _sha256_bytes(raw)
+    path = str(request.url.path or "")[:200]
+    user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    resp_raw = bytes(getattr(response, "body", b"{}") or b"{}")
+    resp_text = resp_raw.decode("utf-8", errors="replace")
+    with get_conn_for_database("MicroServicios") as conn:
+      cur = conn.cursor()
+      cur.execute(
+        """
+        IF NOT EXISTS (
+          SELECT 1 FROM dbo.AppIdempotency
+          WHERE IdempotencyKey = ?
+            AND Path = ?
+            AND ((UserId IS NULL AND ? IS NULL) OR UserId = ?)
+        )
+        BEGIN
+          INSERT INTO dbo.AppIdempotency (IdempotencyKey, Path, UserId, RequestHash, StatusCode, ResponseJson)
+          VALUES (?, ?, ?, ?, ?, ?);
+        END
+        """,
+        (key, path, user_id, user_id, key, path, user_id, req_hash, status_code, resp_text),
       )
       conn.commit()
   except Exception:
@@ -611,6 +880,9 @@ async def auth_login(request: Request) -> ORJSONResponse:
   secret = _auth_secret()
   if not secret:
     raise HTTPException(status_code=503, detail="AUTH_SECRET no configurada en el servidor")
+
+  _reject_if_too_large(request, 16384)
+  _check_login_rate_limit(request)
 
   body = await request.json()
   username = str((body or {}).get("username") or "").strip()
@@ -716,7 +988,7 @@ async def auth_login(request: Request) -> ORJSONResponse:
     value=token,
     httponly=True,
     samesite="strict",
-    secure=(request.url.scheme == "https"),
+    secure=_is_secure_request(request),
     max_age=12 * 60 * 60,
     path="/",
   )
@@ -1983,6 +2255,7 @@ def get_config_recargos() -> ORJSONResponse:
 
 @app.post("/api/config/recargos")
 async def upsert_config_recargos(request: Request) -> ORJSONResponse:
+  _reject_if_too_large(request, _UPLOAD_JSON_MAX_BYTES)
   try:
     payload = await request.json()
   except Exception:
@@ -2072,6 +2345,7 @@ def get_config_inpc_file(filename: str) -> ORJSONResponse:
 @app.put("/api/config/inpc/{filename}")
 async def put_config_inpc_file(filename: str, request: Request) -> ORJSONResponse:
   name = _safe_inpc_filename(filename)
+  _reject_if_too_large(request, _UPLOAD_JSON_MAX_BYTES)
   try:
     payload = await request.json()
   except Exception:
@@ -2108,6 +2382,8 @@ async def upload_config_inpc(file: UploadFile = File(...)) -> ORJSONResponse:
   raw = await file.read()
   if not raw:
     raise HTTPException(status_code=400, detail="Archivo vacío")
+  if len(raw) > int(_UPLOAD_JSON_MAX_BYTES):
+    raise HTTPException(status_code=413, detail="Archivo demasiado grande")
   try:
     payload = orjson.loads(raw)
   except Exception:
@@ -2175,7 +2451,16 @@ def fuentes(
 @app.post("/api/consolidar")
 async def consolidar(request: Request, x_admin_key: Optional[str] = Header(default=None)) -> ORJSONResponse:
   _require_admin(x_admin_key)
-  body = await request.json()
+  _reject_if_too_large(request, _UPLOAD_JSON_MAX_BYTES)
+  try:
+    body = await request.json()
+  except Exception:
+    body = {}
+
+  user = _get_current_user(request) or {}
+  cached = _idempotency_lookup(request, user, body)
+  if cached is not None:
+    return cached
 
  
   try:
@@ -2185,6 +2470,9 @@ async def consolidar(request: Request, x_admin_key: Optional[str] = Header(defau
     cve_fte_mt = str(body.get("cveFteMT") or "MTULUM")
     nuevo_estado = str(body.get("nuevoEstado") or "PP")
     vencimiento = str(body.get("vencimientoFecha")).strip() if body.get("vencimientoFecha") else None
+
+    lk = _lock_key("consolidar", cve_fte_mt, grupo_tramite_id, solicitud_id, ano)
+    _acquire_lock(lk, user, ttl_seconds=120)
  
     conn = get_conn()
     try:
@@ -2294,28 +2582,43 @@ async def consolidar(request: Request, x_admin_key: Optional[str] = Header(defau
     finally:
       conn.close()
  
-    return ORJSONResponse(
-        {
-          "ok": True,
-          "filtros": {"grupoTramiteId": grupo_tramite_id, "solicitudId": solicitud_id, "ano": ano, "cveFteMT": cve_fte_mt},
-          "resumen": resumen,
-          "rows": rows,
-        }
+    resp = ORJSONResponse(
+      {
+        "ok": True,
+        "filtros": {"grupoTramiteId": grupo_tramite_id, "solicitudId": solicitud_id, "ano": ano, "cveFteMT": cve_fte_mt},
+        "resumen": resumen,
+        "rows": rows,
+      }
     )
+    _idempotency_store(request, user, body, resp)
+    return resp
   except HTTPException:
     raise
   except Exception as e:
     return ORJSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+  finally:
+    try:
+      if "lk" in locals():
+        _release_lock(lk, user)
+    except Exception:
+      pass
  
  
 @app.post("/api/activaciones")
 async def activaciones(request: Request, x_admin_key: Optional[str] = Header(default=None)) -> ORJSONResponse:
   _require_admin(x_admin_key)
+  _reject_if_too_large(request, _UPLOAD_JSON_MAX_BYTES)
+  user = _get_current_user(request) or {}
   try:
-    try:
-      await request.json()
-    except Exception:
-      pass
+    body = await request.json()
+  except Exception:
+    body = {}
+  cached = _idempotency_lookup(request, user, body)
+  if cached is not None:
+    return cached
+  try:
+    lk = _lock_key("activaciones")
+    _acquire_lock(lk, user, ttl_seconds=180)
 
     conn = get_conn()
     try:
@@ -2357,7 +2660,7 @@ async def activaciones(request: Request, x_admin_key: Optional[str] = Header(def
       paquete_rows = int(paquete_row[0]) if paquete_row else 0
 
       conn.commit()
-      return ORJSONResponse(
+      resp = ORJSONResponse(
         {
           "ok": True,
           "updated_rows": {
@@ -2367,6 +2670,8 @@ async def activaciones(request: Request, x_admin_key: Optional[str] = Header(def
           },
         }
       )
+      _idempotency_store(request, user, body, resp)
+      return resp
     except Exception:
       conn.rollback()
       raise
@@ -2376,6 +2681,12 @@ async def activaciones(request: Request, x_admin_key: Optional[str] = Header(def
     raise
   except Exception as e:
     return ORJSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+  finally:
+    try:
+      if "lk" in locals():
+        _release_lock(lk, user)
+    except Exception:
+      pass
 
 
 def _parse_date(value: Optional[str]) -> Optional[datetime]:

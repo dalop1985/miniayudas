@@ -42,12 +42,20 @@ function requireAdmin(req) {
   }
 }
 
+function isEnabledEnv(value) {
+  return ["1", "true", "yes", "y", "si", "sí"].includes(String(value || "").trim().toLowerCase());
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
 app.get("/api/test-connection", async (_req, res) => {
   try {
+    if (!isEnabledEnv(process.env.ENABLE_TEST_CONNECTION)) {
+      return res.status(404).json({ ok: false, error: "Endpoint deshabilitado" });
+    }
+    requireAdmin(_req);
     const cfg = getDbConfig();
     const pool = await getPool();
     const result = await pool.request().query(`
@@ -72,7 +80,7 @@ app.get("/api/test-connection", async (_req, res) => {
       connection: result.recordset[0]
     });
   } catch (e) {
-    res.status(500).json({
+    res.status(e.status || 500).json({
       ok: false,
       error: e.message
     });
@@ -81,6 +89,7 @@ app.get("/api/test-connection", async (_req, res) => {
 
 app.get("/api/fuentes", async (req, res) => {
   try {
+    requireAdmin(req);
     const solicitudId = parseIntStrict(req.query.solicitudId, "solicitudId");
     const ano = parseIntStrict(req.query.ano, "ano");
     const grupoTramiteId = req.query.grupoTramiteId
@@ -118,12 +127,13 @@ app.get("/api/fuentes", async (req, res) => {
       rows: result.recordset
     });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
+    res.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
 
 app.get("/api/reportes/prediales/sabana", async (req, res) => {
   try {
+    requireAdmin(req);
     const cveFteMT = (req.query.cveFteMT || "MTULUM").toString();
     const q = req.query.q ? req.query.q.toString().trim() : "";
     const limitRaw = req.query.limit ? Number(req.query.limit) : 200;
@@ -266,7 +276,7 @@ app.get("/api/reportes/prediales/sabana", async (req, res) => {
       rows
     });
   } catch (e) {
-    res.status(400).json({ ok: false, error: e.message });
+    res.status(e.status || 400).json({ ok: false, error: e.message });
   }
 });
 
@@ -283,6 +293,7 @@ function csvEscape(value) {
 
 app.get("/api/reportes/prediales/sabana.csv", async (req, res) => {
   try {
+    requireAdmin(req);
     const cveFteMT = (req.query.cveFteMT || "MTULUM").toString();
     const q = req.query.q ? req.query.q.toString().trim() : "";
     const fromAlta = req.query.fromAlta ? new Date(req.query.fromAlta.toString()) : null;
@@ -686,6 +697,7 @@ app.get("/api/reportes/prediales/sabana-pagos", async (req, res) => {
 
 app.get("/api/reportes/prediales/sabana-pagos.csv", async (req, res) => {
   try {
+    requireAdmin(req);
     const cveFteMT = (req.query.cveFteMT || "MTULUM").toString();
     let claveCatastral = req.query.claveCatastral ? req.query.claveCatastral.toString().trim() : "";
     let claveCatastralFrom = req.query.claveCatastralFrom

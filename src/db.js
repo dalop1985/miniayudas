@@ -1,16 +1,12 @@
+"use strict";
+
 const sql = require("mssql");
 
 let poolPromise;
 
-function normalizeBool(value, fallback = false) {
-  if (value === undefined || value === null || value === "") return fallback;
-  return ["true", "1", "yes", "y"].includes(String(value).toLowerCase());
-}
-
 function parseExtraParams(raw) {
   const params = {};
   if (!raw) return params;
-
   for (const item of String(raw).split(";")) {
     const chunk = item.trim();
     if (!chunk) continue;
@@ -24,67 +20,103 @@ function isIpAddress(value) {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(String(value || ""));
 }
 
+function boolish(value, defaultValue) {
+  if (value === undefined || value === null || String(value).trim() === "") return !!defaultValue;
+  return ["true", "1", "yes", "y", "si", "sí"].includes(String(value).trim().toLowerCase());
+}
+
+function envInt(name, fallback) {
+  const raw = process.env[name];
+  const n = raw === undefined ? NaN : Number(raw);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
 function getDbConfig() {
-  const engine = (process.env.DB_ENGINE || "mssql").toLowerCase();
+  const engine = String(process.env.DB_ENGINE || "mssql").trim().toLowerCase();
   if (engine !== "mssql") {
-    throw new Error(`DB_ENGINE no soportado: ${process.env.DB_ENGINE}`);
+    throw new Error(`DB_ENGINE no soportado: ${engine}`);
   }
 
-  const server = process.env.DB_HOST || process.env.DB_SERVER;
-  const database = process.env.DB_NAME || process.env.DB_DATABASE || "Tulum";
-  const user = process.env.DB_USER;
-  const password = process.env.DB_PASSWORD;
-  const port = process.env.DB_PORT ? Number(process.env.DB_PORT) : undefined;
-  const extra = parseExtraParams(process.env.DB_EXTRA_PARAMS);
+  const host = String(process.env.DB_HOST || "").trim();
+  const name = String(process.env.DB_NAME || "").trim();
+  const user = String(process.env.DB_USER || "").trim();
+  const password = String(process.env.DB_PASSWORD || "");
+  const port = envInt("DB_PORT", 1433);
+  const extraParams = String(process.env.DB_EXTRA_PARAMS || "");
+  const trustServerCertificateDefault = boolish(process.env.DB_TRUST_SERVER_CERT, true);
+  const tlsServerName = String(process.env.DB_TLS_SERVER_NAME || "").trim();
 
-  if (!server) throw new Error("Falta DB_HOST o DB_SERVER");
+  if (!host) throw new Error("Falta DB_HOST");
+  if (!name) throw new Error("Falta DB_NAME");
   if (!user) throw new Error("Falta DB_USER");
   if (!password) throw new Error("Falta DB_PASSWORD");
 
-  const encrypt = normalizeBool(extra.encrypt, normalizeBool(process.env.DB_ENCRYPT, true));
-  const trustServerCertificate = normalizeBool(
-    extra.trustservercertificate,
-    normalizeBool(process.env.DB_TRUST_SERVER_CERT, true)
-  );
-  const tlsServerName = process.env.DB_TLS_SERVER_NAME || "";
+  const extra = parseExtraParams(extraParams);
+  const encryptInExtra = extra.encrypt;
+  const trustInExtra = extra.trustservercertificate;
+
+  const encrypt =
+    encryptInExtra !== undefined
+      ? ["yes", "true", "1"].includes(String(encryptInExtra).toLowerCase())
+      : true;
+  const trustServerCertificate =
+    trustInExtra !== undefined
+      ? ["yes", "true", "1"].includes(String(trustInExtra).toLowerCase())
+      : trustServerCertificateDefault;
 
   const options = {
     encrypt,
-    trustServerCertificate
+    trustServerCertificate,
   };
 
   if (tlsServerName) {
     options.serverName = tlsServerName;
     options.cryptoCredentialsDetails = { servername: tlsServerName };
-  } else if (encrypt && isIpAddress(server)) {
+  } else if (encrypt && isIpAddress(host)) {
     const fallbackServerName = "sqlserver";
     options.serverName = fallbackServerName;
     options.cryptoCredentialsDetails = { servername: fallbackServerName };
   }
 
   return {
-    server,
+    server: host,
     user,
     password,
-    database,
+    database: name,
     port,
     options,
+    requestTimeout: 60000,
+    connectionTimeout: 15000,
     pool: {
-      max: 10,
+      max: 15,
       min: 0,
-      idleTimeoutMillis: 30000
-    }
+      idleTimeoutMillis: 30000,
+    },
   };
 }
 
 async function getPool() {
   if (!poolPromise) {
-    poolPromise = new sql.ConnectionPool(getDbConfig()).connect().catch((error) => {
-      poolPromise = undefined;
-      throw error;
-    });
+    poolPromise = new sql.ConnectionPool(getDbConfig())
+      .connect()
+      .catch((error) => {
+        poolPromise = undefined;
+        throw error;
+      });
   }
   return poolPromise;
 }
 
-module.exports = { sql, getDbConfig, getPool };
+async function closePool() {
+  if (!poolPromise) return;
+  try {
+    const pool = await poolPromise;
+    await pool.close();
+  } catch (e) {
+    /* swallow */
+  } finally {
+    poolPromise = undefined;
+  }
+}
+
+module.exports = { sql, getDbConfig, getPool, closePool };
