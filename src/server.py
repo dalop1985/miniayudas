@@ -422,6 +422,30 @@ def _parse_factus_input(raw: Any) -> List[Dict[str, Any]]:
       except Exception:
         continue
   return items
+
+
+def _parse_factus_range(raw: Any) -> Optional[Dict[str, Any]]:
+  if raw is None:
+    return None
+  if isinstance(raw, dict):
+    serie = str(raw.get("serie") or "").strip().upper()
+    folio_from_raw = raw.get("folioFrom")
+    folio_to_raw = raw.get("folioTo")
+    if not serie and (folio_from_raw is None and folio_to_raw is None):
+      return None
+    try:
+      folio_from = int(str(folio_from_raw).strip())
+      folio_to = int(str(folio_to_raw).strip())
+    except Exception:
+      raise HTTPException(status_code=400, detail="Rango de folios inválido")
+    if not serie:
+      raise HTTPException(status_code=400, detail="Serie requerida para rango")
+    if folio_from <= 0 or folio_to <= 0:
+      raise HTTPException(status_code=400, detail="Rango de folios inválido")
+    if folio_to < folio_from:
+      folio_from, folio_to = folio_to, folio_from
+    return {"serie": serie, "folioFrom": folio_from, "folioTo": folio_to}
+  return None
  
  
 def get_db_target() -> Dict[str, Any]:
@@ -663,7 +687,7 @@ def _ensure_auth_schema_microservicios() -> None:
       CREATE TABLE dbo.AppIdempotency (
         IdempotencyKey NVARCHAR(80) NOT NULL,
         Path           NVARCHAR(200) NOT NULL,
-        UserId         INT NULL,
+        UserId         INT NOT NULL CONSTRAINT DF_AppIdempotency_UserId DEFAULT (0),
         CreatedAt      DATETIME2(0) NOT NULL CONSTRAINT DF_AppIdempotency_CreatedAt DEFAULT (SYSUTCDATETIME()),
         RequestHash    VARBINARY(32) NULL,
         StatusCode     INT NOT NULL,
@@ -715,7 +739,7 @@ def _ensure_auth_schema_microservicios() -> None:
         StartedAt        DATETIME2(0) NULL,
         FinishedAt       DATETIME2(0) NULL,
         ExpiresAt        DATETIME2(0) NOT NULL,
-        RowCount         INT NULL,
+        RowsCount        INT NULL,
         FileName         NVARCHAR(200) NULL,
         ErrorMessage     NVARCHAR(400) NULL
       );
@@ -890,7 +914,7 @@ def _idempotency_lookup(request: Request, user: Dict[str, Any], body: Any) -> Op
     raw = orjson.dumps({})
   req_hash = _sha256_bytes(raw)
   path = str(request.url.path or "")[:200]
-  user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+  user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else 0
   with get_conn_for_database("MicroServicios") as conn:
     cur = conn.cursor()
     cur.execute(
@@ -899,9 +923,9 @@ def _idempotency_lookup(request: Request, user: Dict[str, Any], body: Any) -> Op
       FROM dbo.AppIdempotency
       WHERE IdempotencyKey = ?
         AND Path = ?
-        AND ((UserId IS NULL AND ? IS NULL) OR UserId = ?);
+        AND UserId = ?;
       """,
-      (key, path, user_id, user_id),
+      (key, path, user_id),
     )
     rows = cur.fetchall()
     if not rows:
@@ -930,7 +954,7 @@ def _idempotency_store(request: Request, user: Dict[str, Any], body: Any, respon
       raw = orjson.dumps({})
     req_hash = _sha256_bytes(raw)
     path = str(request.url.path or "")[:200]
-    user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+    user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else 0
     status_code = int(getattr(response, "status_code", 200) or 200)
     resp_raw = bytes(getattr(response, "body", b"{}") or b"{}")
     resp_text = resp_raw.decode("utf-8", errors="replace")
@@ -942,14 +966,14 @@ def _idempotency_store(request: Request, user: Dict[str, Any], body: Any, respon
           SELECT 1 FROM dbo.AppIdempotency
           WHERE IdempotencyKey = ?
             AND Path = ?
-            AND ((UserId IS NULL AND ? IS NULL) OR UserId = ?)
+            AND UserId = ?
         )
         BEGIN
           INSERT INTO dbo.AppIdempotency (IdempotencyKey, Path, UserId, RequestHash, StatusCode, ResponseJson)
           VALUES (?, ?, ?, ?, ?, ?);
         END
         """,
-        (key, path, user_id, user_id, key, path, user_id, req_hash, status_code, resp_text),
+        (key, path, user_id, key, path, user_id, req_hash, status_code, resp_text),
       )
       conn.commit()
   except Exception:
@@ -1133,8 +1157,77 @@ async def auth_login(request: Request) -> ORJSONResponse:
     )
     rows = cur.fetchall()
     if not rows:
-      _audit_auth_event("login_fail", username, None, request, "user_not_found")
-      raise HTTPException(status_code=401, detail="Credenciales inválidas")
+      try:
+        cur.execute("SELECT COUNT(1) AS cnt FROM dbo.AppUsers;")
+        cnt_row = cur.fetchone()
+        total_users = int(cnt_row[0]) if cnt_row else 0
+      except Exception:
+        total_users = 0
+
+      bootstrap_username = str(os.getenv("BOOTSTRAP_ADMIN_USERNAME") or "admin@tulum.gob.mx").strip()
+      bootstrap_password = str(os.getenv("BOOTSTRAP_ADMIN_PASSWORD") or (os.getenv("ADMIN_KEY") or "")).strip()
+
+      if total_users == 0:
+        if bootstrap_username and username.lower() != bootstrap_username.lower():
+          raise HTTPException(
+            status_code=401,
+            detail=f"Sistema sin usuarios. Inicia sesión con {bootstrap_username}.",
+          )
+        if bootstrap_username and bootstrap_password and username.lower() == bootstrap_username.lower() and password != bootstrap_password:
+          raise HTTPException(
+            status_code=401,
+            detail="Sistema sin usuarios. Usa la ADMIN_KEY como contraseña temporal (o configura BOOTSTRAP_ADMIN_PASSWORD).",
+          )
+
+      if (
+        total_users == 0
+        and bootstrap_username
+        and bootstrap_password
+        and username.lower() == bootstrap_username.lower()
+        and password == bootstrap_password
+      ):
+        salt = secrets.token_bytes(16)
+        iterations = 210000
+        pw_hash = _pbkdf2_hash(password, salt, iterations)
+        try:
+          cur.execute(
+            """
+            INSERT INTO dbo.AppUsers (Username, DisplayName, Role, PasswordSalt, PasswordHash, PasswordIterations, IsActive)
+            VALUES (?, ?, 'admin', ?, ?, ?, 1);
+            """,
+            (bootstrap_username, "Administrador", salt, pw_hash, iterations),
+          )
+          conn.commit()
+          _audit_auth_event("bootstrap_admin_created", bootstrap_username, None, request, None)
+        except Exception:
+          try:
+            conn.rollback()
+          except Exception:
+            pass
+
+        cur.execute(
+          """
+          SELECT TOP 1
+            UserId,
+            Username,
+            COALESCE(DisplayName, Username) AS DisplayName,
+            Role,
+            PasswordSalt,
+            PasswordHash,
+            PasswordIterations,
+            IsActive,
+            FailedAttempts,
+            LockedUntil
+          FROM dbo.AppUsers
+          WHERE Username = ?;
+          """,
+          (bootstrap_username,),
+        )
+        rows = cur.fetchall()
+
+      if not rows:
+        _audit_auth_event("login_fail", username, None, request, "user_not_found")
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
     row = rows[0]
     user_id = int(row[0])
@@ -3032,7 +3125,7 @@ def _update_report_job(job_id: str, status: str, started: bool = False, finished
           Status = ?,
           StartedAt = COALESCE(StartedAt, ?),
           FinishedAt = CASE WHEN ? IS NULL THEN FinishedAt ELSE ? END,
-          RowCount = COALESCE(?, RowCount),
+          RowsCount = COALESCE(?, RowsCount),
           ErrorMessage = COALESCE(?, ErrorMessage)
         WHERE JobId = ?;
         """,
@@ -3059,7 +3152,7 @@ def _get_report_job(job_id: str) -> Optional[Dict[str, Any]]:
         StartedAt AS startedAt,
         FinishedAt AS finishedAt,
         ExpiresAt AS expiresAt,
-        RowCount AS rowCount,
+        RowsCount AS rowCount,
         FileName AS fileName,
         ErrorMessage AS errorMessage
       FROM dbo.AppReportJobs
@@ -8545,9 +8638,11 @@ async def factus(request: Request) -> ORJSONResponse:
   except Exception:
     payload = {}
 
-  cve_fte_mt = str(payload.get("cveFteMT") or "MTULUM")
+  default_cve_fte_mt = os.getenv("FACTUS_CVE_FTE_MT") or "MTULUM"
+  cve_fte_mt = str(payload.get("cveFteMT") or default_cve_fte_mt)
+  range_obj = _parse_factus_range(payload.get("range")) or _parse_factus_range(payload)
   raw = payload.get("input") or ""
-  items = _parse_factus_input(raw)
+  items = _parse_factus_input(raw) if not range_obj else []
 
   def pick_key(keys: List[str], contains_any: List[str], contains_all: Optional[List[str]] = None) -> Optional[str]:
     for k in keys:
@@ -8568,138 +8663,206 @@ async def factus(request: Request) -> ORJSONResponse:
     except Exception:
       return None
 
+  def header_fields(header_row: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    header_keys = list(header_row.keys()) if header_row else []
+
+    fecha_val = None
+    if header_row:
+      for k in ["ReciboFecha", "FechaRecibo", "ReciboPagoFecha", "ReciboFechaPago"]:
+        if k in header_row:
+          fecha_val = header_row.get(k)
+          break
+      if fecha_val is None:
+        fecha_key = pick_key(header_keys, ["fecha"])
+        fecha_val = header_row.get(fecha_key) if fecha_key else None
+    if isinstance(fecha_val, datetime):
+      fecha_val = fecha_val.isoformat()
+
+    nombre_val = header_row.get("ContriRec") if header_row else ""
+    rfc_val = header_row.get("RFCRecibo") if header_row else ""
+    obs_val = header_row.get("ReciboObservaciones") if header_row else ""
+    return (str(fecha_val or ""), str(nombre_val or ""), str(rfc_val or ""), str(obs_val or ""))
+
+  def append_rows_for_receipt(serie: str, folio: int, header_row: Dict[str, Any], detail_rows: List[Dict[str, Any]]) -> None:
+    if not detail_rows and not header_row:
+      rows_out.append(
+        {
+          "Serie": serie,
+          "Folio": folio,
+          "Fecha": "",
+          "Nombre": "",
+          "RFC": "",
+          "Observaciones": "",
+          "Concepto": "No encontrado",
+          "Total": 0,
+        }
+      )
+      return
+    if not detail_rows:
+      rows_out.append(
+        {
+          "Serie": serie,
+          "Folio": folio,
+          "Fecha": "",
+          "Nombre": "",
+          "RFC": "",
+          "Observaciones": "",
+          "Concepto": "Sin detalle",
+          "Total": 0,
+        }
+      )
+      return
+
+    fecha_val, nombre_val, rfc_val, obs_val = header_fields(header_row)
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for r in detail_rows:
+      fte = r.get("CveFteIng")
+      fte_str = str(fte) if fte is not None else ""
+      if fte_str not in grouped:
+        grouped[fte_str] = {"Concepto": None, "Total": decimal.Decimal("0")}
+        order.append(fte_str)
+      if grouped[fte_str]["Concepto"] in (None, "") and fte_str:
+        grouped[fte_str]["Concepto"] = fte_str
+      amount_val = to_decimal(r.get("Total"))
+      if amount_val is not None:
+        grouped[fte_str]["Total"] += amount_val
+
+    for idx, fte_str in enumerate(order):
+      concept_val = grouped[fte_str]["Concepto"] or (fte_str if fte_str else "")
+      if idx == 0:
+        rows_out.append(
+          {
+            "Serie": serie,
+            "Folio": folio,
+            "Fecha": fecha_val,
+            "Nombre": nombre_val,
+            "RFC": rfc_val,
+            "Observaciones": obs_val,
+            "Concepto": concept_val,
+            "Total": float(grouped[fte_str]["Total"]),
+          }
+        )
+      else:
+        rows_out.append(
+          {
+            "Serie": "",
+            "Folio": "",
+            "Fecha": "",
+            "Nombre": "",
+            "RFC": "",
+            "Observaciones": "",
+            "Concepto": concept_val,
+            "Total": float(grouped[fte_str]["Total"]),
+          }
+        )
+
   rows_out: List[Dict[str, Any]] = []
   database = os.getenv("FACTUS_DB_NAME") or "Tulum_Alterno"
   with get_conn_for_database(database) as conn:
     cur = conn.cursor()
-    for item in items:
-      serie = str(item.get("serie") or "").strip()
-      folio = item.get("folio")
-      if not serie or folio is None:
-        continue
+    if range_obj:
+      serie = str(range_obj.get("serie") or "").strip().upper()
+      folio_from = int(range_obj.get("folioFrom"))
+      folio_to = int(range_obj.get("folioTo"))
+      max_range_raw = os.getenv("FACTUS_MAX_RANGE") or "500"
+      max_range = int(max_range_raw) if str(max_range_raw).isdigit() else 500
+      if (folio_to - folio_from + 1) > max_range:
+        raise HTTPException(status_code=400, detail=f"Rango demasiado grande (máximo {max_range})")
 
-      header_row: Dict[str, Any] = {}
       cur.execute(
         """
-        SELECT TOP 1 *
+        SELECT CveFolio AS FolioKey, *
         FROM COQRECIBOS
         WHERE CveFteMT = ?
           AND CveSerFol = ?
-          AND CveFolio = ?
+          AND CveFolio BETWEEN ? AND ?
           AND EdoRec = 'A'
+        ORDER BY CveFolio ASC
         OPTION (RECOMPILE);
         """,
-        (cve_fte_mt, serie, folio),
+        (cve_fte_mt, serie, folio_from, folio_to),
       )
-      header_try = _rows(cur)
-      if header_try:
-        header_row = header_try[0]
+      headers = _rows(cur)
+      header_by_folio: Dict[int, Dict[str, Any]] = {}
+      for h in headers:
+        try:
+          fk = int(h.get("FolioKey"))
+        except Exception:
+          continue
+        header_by_folio[fk] = h
 
       cur.execute(
         """
         SELECT
+          CveFolio AS FolioKey,
           CveFteIng,
           SUM(COALESCE(ReciboDetImpAntesDev, 0)) AS Total
         FROM COQRECIBODETALLE
         WHERE CveFteMT = ?
           AND CveSerFol = ?
-          AND CveFolio = ?
-        GROUP BY CveFteIng
-        ORDER BY CveFteIng ASC
+          AND CveFolio BETWEEN ? AND ?
+        GROUP BY CveFolio, CveFteIng
+        ORDER BY CveFolio ASC, CveFteIng ASC
         OPTION (RECOMPILE);
         """,
-        (cve_fte_mt, serie, folio),
+        (cve_fte_mt, serie, folio_from, folio_to),
       )
-      data = _rows(cur)
-      if not data and not header_row:
-        rows_out.append(
-          {
-            "Serie": serie,
-            "Folio": folio,
-            "Fecha": "",
-            "Nombre": "",
-            "RFC": "",
-            "Observaciones": "",
-            "Concepto": "No encontrado",
-            "Total": 0,
-          }
+      details = _rows(cur)
+      details_by_folio: Dict[int, List[Dict[str, Any]]] = {}
+      for d in details:
+        try:
+          fk = int(d.get("FolioKey"))
+        except Exception:
+          continue
+        if fk not in details_by_folio:
+          details_by_folio[fk] = []
+        details_by_folio[fk].append(d)
+
+      for folio in range(folio_from, folio_to + 1):
+        append_rows_for_receipt(serie, folio, header_by_folio.get(folio, {}), details_by_folio.get(folio, []))
+    else:
+      for item in items:
+        serie = str(item.get("serie") or "").strip()
+        folio = item.get("folio")
+        if not serie or folio is None:
+          continue
+
+        header_row: Dict[str, Any] = {}
+        cur.execute(
+          """
+          SELECT TOP 1 *
+          FROM COQRECIBOS
+          WHERE CveFteMT = ?
+            AND CveSerFol = ?
+            AND CveFolio = ?
+            AND EdoRec = 'A'
+          OPTION (RECOMPILE);
+          """,
+          (cve_fte_mt, serie, folio),
         )
-        continue
-      if not data:
-        rows_out.append(
-          {
-            "Serie": serie,
-            "Folio": folio,
-            "Fecha": "",
-            "Nombre": "",
-            "RFC": "",
-            "Observaciones": "",
-            "Concepto": "Sin detalle",
-            "Total": 0,
-          }
+        header_try = _rows(cur)
+        if header_try:
+          header_row = header_try[0]
+
+        cur.execute(
+          """
+          SELECT
+            CveFteIng,
+            SUM(COALESCE(ReciboDetImpAntesDev, 0)) AS Total
+          FROM COQRECIBODETALLE
+          WHERE CveFteMT = ?
+            AND CveSerFol = ?
+            AND CveFolio = ?
+          GROUP BY CveFteIng
+          ORDER BY CveFteIng ASC
+          OPTION (RECOMPILE);
+          """,
+          (cve_fte_mt, serie, folio),
         )
-        continue
-
-      header_keys = list(header_row.keys()) if header_row else []
-
-      fecha_val = None
-      if header_row:
-        for k in ["ReciboFecha", "FechaRecibo", "ReciboPagoFecha", "ReciboFechaPago"]:
-          if k in header_row:
-            fecha_val = header_row.get(k)
-            break
-        if fecha_val is None:
-          fecha_key = pick_key(header_keys, ["fecha"])
-          fecha_val = header_row.get(fecha_key) if fecha_key else None
-      if isinstance(fecha_val, datetime):
-        fecha_val = fecha_val.isoformat()
-
-      nombre_val = header_row.get("ContriRec") if header_row else ""
-      rfc_val = header_row.get("RFCRecibo") if header_row else ""
-      obs_val = header_row.get("ReciboObservaciones") if header_row else ""
-
-      grouped: Dict[str, Dict[str, Any]] = {}
-      order: List[str] = []
-      for r in data:
-        fte = r.get("CveFteIng")
-        fte_str = str(fte) if fte is not None else ""
-        if fte_str not in grouped:
-          grouped[fte_str] = {"Concepto": None, "Total": decimal.Decimal("0")}
-          order.append(fte_str)
-        if grouped[fte_str]["Concepto"] in (None, "") and fte_str:
-          grouped[fte_str]["Concepto"] = fte_str
-        amount_val = to_decimal(r.get("Total"))
-        if amount_val is not None:
-          grouped[fte_str]["Total"] += amount_val
-
-      for idx, fte_str in enumerate(order):
-        concept_val = grouped[fte_str]["Concepto"] or (fte_str if fte_str else "")
-        if idx == 0:
-          rows_out.append(
-            {
-              "Serie": serie,
-              "Folio": folio,
-              "Fecha": fecha_val or "",
-              "Nombre": nombre_val or "",
-              "RFC": rfc_val or "",
-              "Observaciones": obs_val or "",
-              "Concepto": concept_val,
-              "Total": float(grouped[fte_str]["Total"]),
-            }
-          )
-        else:
-          rows_out.append(
-            {
-              "Serie": "",
-              "Folio": "",
-              "Fecha": "",
-              "Nombre": "",
-              "RFC": "",
-              "Observaciones": "",
-              "Concepto": concept_val,
-              "Total": float(grouped[fte_str]["Total"]),
-            }
-          )
+        data = _rows(cur)
+        append_rows_for_receipt(serie, int(folio), header_row, data)
 
   return ORJSONResponse({"ok": True, "count": len(rows_out), "rows": rows_out})
 

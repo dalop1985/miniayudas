@@ -226,9 +226,9 @@ function TableWithColumns({ rows, columns }) {
   );
 }
 
-function Field({ label, children, hint }) {
+function Field({ label, children, hint, className }) {
   return (
-    <label className="field">
+    <label className={`field${className ? ` ${className}` : ""}`}>
       <span className="field-label">{label}</span>
       {children}
       {hint ? <span className="field-hint">{hint}</span> : null}
@@ -1017,6 +1017,9 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
   const [criReportHasMore, setCriReportHasMore] = useState(false);
   const [criReportNextOffset, setCriReportNextOffset] = useState(null);
   const [factusInput, setFactusInput] = useState("");
+  const [factusRangeSerie, setFactusRangeSerie] = useState("");
+  const [factusRangeFrom, setFactusRangeFrom] = useState("");
+  const [factusRangeTo, setFactusRangeTo] = useState("");
   const [factusRows, setFactusRows] = useState([]);
   const [umaRows, setUmaRows] = useState([]);
   const [umaForm, setUmaForm] = useState({ vigenciaYear: "2025", umaMxn: "" });
@@ -2931,18 +2934,28 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     window.open(`/api/reportes/prediales/sabana-pagos.xlsx?${query.toString()}`, "_blank", "noopener,noreferrer");
   }
 
-  async function loadFactus() {
+  async function loadFactus(mode) {
     setLoading("factus");
     setOutput("Consultando Factus...");
     const t0 = performance.now();
     try {
+      let body = {};
+      if (mode === "rango") {
+        const serie = String(factusRangeSerie || "").trim().toUpperCase();
+        const folioFrom = Number(String(factusRangeFrom || "").trim());
+        const folioTo = Number(String(factusRangeTo || "").trim());
+        if (!serie) throw new Error("Serie requerida para el rango");
+        if (!Number.isInteger(folioFrom) || folioFrom <= 0) throw new Error("Folio desde inválido");
+        if (!Number.isInteger(folioTo) || folioTo <= 0) throw new Error("Folio hasta inválido");
+        body = { range: { serie, folioFrom, folioTo } };
+      } else {
+        body = { input: factusInput };
+      }
+
       const response = await fetch("/api/reportes/factus", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          cveFteMT: form.cveFteMT || "MTULUM",
-          input: factusInput
-        })
+        body: JSON.stringify(body)
       });
       const json = await response.json();
       const t1 = performance.now();
@@ -4098,11 +4111,28 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                 </div>
 
                 <div className="grid">
-                  <Field label="CveFteMT">
-                    <input name="cveFteMT" value={form.cveFteMT} onChange={updateField} />
+                  <Field label="Serie (rango de folios)">
+                    <input value={factusRangeSerie} onChange={(e) => setFactusRangeSerie(e.target.value)} placeholder="AU" />
+                  </Field>
+                  <Field label="Folio desde">
+                    <input
+                      value={factusRangeFrom}
+                      onChange={(e) => setFactusRangeFrom(e.target.value)}
+                      inputMode="numeric"
+                      placeholder="2990"
+                    />
+                  </Field>
+                  <Field label="Folio hasta">
+                    <input
+                      value={factusRangeTo}
+                      onChange={(e) => setFactusRangeTo(e.target.value)}
+                      inputMode="numeric"
+                      placeholder="3010"
+                    />
                   </Field>
                   <Field
-                    label="Serie y folios"
+                    className="grid-span-all"
+                    label="Serie y folios (modo actual)"
                     hint="Ejemplo: Serie AU - Folios 3400, 5000, 3350 (una serie por línea, respeta el orden)"
                   >
                     <textarea
@@ -4115,8 +4145,11 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                 </div>
 
                 <div className="actions">
-                  <button className="primary" onClick={loadFactus} disabled={loading === "factus"}>
-                    {loading === "factus" ? "Consultando..." : "Consultar Factus"}
+                  <button className="primary" onClick={() => loadFactus("lista")} disabled={loading === "factus"}>
+                    {loading === "factus" ? "Consultando..." : "Consultar (lista)"}
+                  </button>
+                  <button className="primary" onClick={() => loadFactus("rango")} disabled={loading === "factus"}>
+                    {loading === "factus" ? "Consultando..." : "Consultar (rango)"}
                   </button>
                 </div>
               </section>
