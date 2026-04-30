@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pyodbc
 import orjson
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, ORJSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
@@ -30,6 +30,14 @@ app = FastAPI()
 UMA_MXN_BY_VIGENCIA_YEAR: Dict[int, decimal.Decimal] = {}
 _UMA_STORE_LOCK = threading.Lock()
 _UMA_STORE_PATH = Path(os.getenv("UMA_STORE_PATH") or (BASE_DIR / "umas.json"))
+
+_INPC_STORE_LOCK = threading.Lock()
+_INPC_STORE_DIR = Path(os.getenv("INPC_STORE_DIR") or (BASE_DIR / "data"))
+_INPC_FILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}\.json$")
+
+RECARGOS_MORA_BY_YEAR: Dict[int, decimal.Decimal] = {}
+_RECARGOS_STORE_LOCK = threading.Lock()
+_RECARGOS_STORE_PATH = Path(os.getenv("RECARGOS_STORE_PATH") or (_INPC_STORE_DIR / "recargos_historico.json"))
 
 
 def _load_umas_from_disk() -> None:
@@ -77,6 +85,139 @@ def _save_umas_to_disk() -> None:
   tmp = path.with_suffix(path.suffix + ".tmp")
   tmp.write_bytes(data)
   os.replace(tmp, path)
+
+
+def _safe_inpc_filename(name: Any) -> str:
+  base = str(name or "").strip()
+  base = base.replace("\\", "/").split("/")[-1].strip()
+  base = re.sub(r"\s+", "_", base)
+  if not base.lower().endswith(".json"):
+    base = base + ".json"
+  if not _INPC_FILE_NAME_RE.match(base):
+    raise HTTPException(status_code=400, detail="Nombre de archivo INPC inválido")
+  return base
+
+
+def _flatten_inpc_payload(payload: Any) -> Dict[str, Any]:
+  if payload is None:
+    return {}
+  if not isinstance(payload, dict):
+    raise HTTPException(status_code=400, detail="INPC inválido")
+  if "inpc_historico" in payload and isinstance(payload.get("inpc_historico"), dict):
+    out: Dict[str, Any] = {}
+    for _year, months in (payload.get("inpc_historico") or {}).items():
+      if not isinstance(months, dict):
+        continue
+      for k, v in months.items():
+        out[str(k)] = v
+    return out
+  return payload
+
+
+def _list_inpc_files() -> List[Path]:
+  try:
+    base = _INPC_STORE_DIR
+    if not base.exists() or not base.is_dir():
+      return []
+    files = [p for p in base.glob("inpc*.json") if p.is_file()]
+    files.sort(key=lambda p: p.name.lower())
+    return files
+  except Exception:
+    return []
+
+
+def _load_inpc_table_from_disk() -> Tuple[Dict[int, decimal.Decimal], List[str]]:
+  flat: Dict[str, Any] = {}
+  sources: List[str] = []
+  for p in _list_inpc_files():
+    try:
+      raw = p.read_bytes()
+      data = orjson.loads(raw) if raw else {}
+      part = _flatten_inpc_payload(data)
+      if not isinstance(part, dict):
+        continue
+      flat.update(part)
+      sources.append(p.name)
+    except Exception:
+      continue
+  return _parse_inpc_table(flat), sources
+
+
+def _load_recargos_from_disk() -> None:
+  try:
+    path = _RECARGOS_STORE_PATH
+    if not path.exists():
+      return
+    raw = path.read_bytes()
+    data = orjson.loads(raw) if raw else {}
+    if not isinstance(data, dict):
+      return
+    items = data.get("items") if isinstance(data.get("items"), list) else None
+    tasas = data.get("tasas") if isinstance(data.get("tasas"), dict) else None
+    RECARGOS_MORA_BY_YEAR.clear()
+    if items:
+      for item in items:
+        if not isinstance(item, dict):
+          continue
+        year_raw = item.get("year") if item.get("year") is not None else item.get("ejercicioYear")
+        tasa_raw = item.get("tasaMora") if item.get("tasaMora") is not None else item.get("tasaMensual")
+        try:
+          year = int(str(year_raw).strip())
+        except Exception:
+          continue
+        if tasa_raw in (None, "", "null"):
+          continue
+        try:
+          tasa = decimal.Decimal(str(tasa_raw).strip())
+        except Exception:
+          continue
+        if tasa <= 0:
+          continue
+        RECARGOS_MORA_BY_YEAR[year] = tasa
+      return
+    if tasas:
+      for k, v in tasas.items():
+        try:
+          year = int(str(k).strip())
+        except Exception:
+          continue
+        try:
+          tasa = decimal.Decimal(str(v).strip())
+        except Exception:
+          continue
+        if tasa <= 0:
+          continue
+        RECARGOS_MORA_BY_YEAR[year] = tasa
+  except Exception:
+    return
+
+
+def _save_recargos_to_disk() -> None:
+  path = _RECARGOS_STORE_PATH
+  path.parent.mkdir(parents=True, exist_ok=True)
+  items = []
+  for year in sorted(RECARGOS_MORA_BY_YEAR.keys()):
+    v = RECARGOS_MORA_BY_YEAR.get(year)
+    if v is None:
+      continue
+    items.append({"year": year, "tasaMora": str(v)})
+  payload = {"version": 1, "tipo": "mora", "items": items, "count": len(items)}
+  data = orjson.dumps(payload, option=orjson.OPT_INDENT_2)
+  tmp = path.with_suffix(path.suffix + ".tmp")
+  tmp.write_bytes(data)
+  os.replace(tmp, path)
+
+
+def _recargo_mora_rate_for_year(year: int, table: Dict[int, decimal.Decimal]) -> decimal.Decimal:
+  if not table:
+    return decimal.Decimal("0")
+  y = int(year)
+  if y in table:
+    return table[y]
+  candidates = [k for k in table.keys() if k <= y]
+  if candidates:
+    return table[max(candidates)]
+  return table[min(table.keys())]
  
  
 def _uma_vigencia_year_for_date(value: datetime) -> int:
@@ -88,6 +229,7 @@ def get_uma_mxn_for_date(value: datetime) -> Optional[decimal.Decimal]:
  
 
 _load_umas_from_disk()
+_load_recargos_from_disk()
 
  
 def _normalize_bool(value: Any, fallback: bool = False) -> bool:
@@ -1826,6 +1968,161 @@ async def upsert_config_umas(request: Request) -> ORJSONResponse:
     except Exception as e:
       return ORJSONResponse(status_code=500, content={"ok": False, "error": str(e)})
   return ORJSONResponse({"ok": True, "vigenciaYear": year, "umaMxn": float(uma)})
+
+
+@app.get("/api/config/recargos")
+def get_config_recargos() -> ORJSONResponse:
+  items = []
+  for year in sorted(RECARGOS_MORA_BY_YEAR.keys()):
+    v = RECARGOS_MORA_BY_YEAR.get(year)
+    if v is None:
+      continue
+    items.append({"year": year, "tasaMora": float(v)})
+  return ORJSONResponse({"ok": True, "tipo": "mora", "items": items, "count": len(items)})
+
+
+@app.post("/api/config/recargos")
+async def upsert_config_recargos(request: Request) -> ORJSONResponse:
+  try:
+    payload = await request.json()
+  except Exception:
+    payload = {}
+
+  year_raw = payload.get("year")
+  tasa_raw = payload.get("tasaMora")
+
+  try:
+    year = int(str(year_raw).strip())
+  except Exception:
+    return ORJSONResponse(status_code=400, content={"ok": False, "error": "year inválido"})
+
+  if tasa_raw in (None, "", "null"):
+    with _RECARGOS_STORE_LOCK:
+      RECARGOS_MORA_BY_YEAR.pop(year, None)
+      try:
+        _save_recargos_to_disk()
+      except Exception as e:
+        return ORJSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+    return ORJSONResponse({"ok": True, "year": year, "deleted": True})
+
+  try:
+    tasa = decimal.Decimal(str(tasa_raw).strip())
+  except Exception:
+    return ORJSONResponse(status_code=400, content={"ok": False, "error": "tasaMora inválida"})
+  if tasa <= 0:
+    return ORJSONResponse(status_code=400, content={"ok": False, "error": "tasaMora inválida"})
+
+  with _RECARGOS_STORE_LOCK:
+    RECARGOS_MORA_BY_YEAR[year] = tasa
+    try:
+      _save_recargos_to_disk()
+    except Exception as e:
+      return ORJSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+  return ORJSONResponse({"ok": True, "year": year, "tasaMora": float(tasa)})
+
+
+@app.get("/api/config/inpc")
+def get_config_inpc() -> ORJSONResponse:
+  items: List[Dict[str, Any]] = []
+  for p in _list_inpc_files():
+    try:
+      stat = p.stat()
+      raw = p.read_bytes()
+      data = orjson.loads(raw) if raw else {}
+      flat = _flatten_inpc_payload(data)
+      table = _parse_inpc_table(flat)
+      min_key = None
+      max_key = None
+      if table:
+        idx_min = min(table.keys())
+        idx_max = max(table.keys())
+        y1 = idx_min // 12
+        m1 = (idx_min % 12) + 1
+        y2 = idx_max // 12
+        m2 = (idx_max % 12) + 1
+        min_key = _predial_ym_key(y1, m1)
+        max_key = _predial_ym_key(y2, m2)
+      items.append(
+        {
+          "name": p.name,
+          "sizeBytes": int(stat.st_size),
+          "updatedAt": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+          "monthCount": int(len(table)),
+          "minKey": min_key,
+          "maxKey": max_key,
+        }
+      )
+    except Exception:
+      continue
+  return ORJSONResponse({"ok": True, "items": items, "count": len(items)})
+
+
+@app.get("/api/config/inpc/{filename}")
+def get_config_inpc_file(filename: str) -> ORJSONResponse:
+  name = _safe_inpc_filename(filename)
+  path = _INPC_STORE_DIR / name
+  if not path.exists() or not path.is_file():
+    raise HTTPException(status_code=404, detail="Archivo INPC no encontrado")
+  raw = path.read_bytes()
+  data = orjson.loads(raw) if raw else {}
+  return ORJSONResponse({"ok": True, "name": name, "data": data})
+
+
+@app.put("/api/config/inpc/{filename}")
+async def put_config_inpc_file(filename: str, request: Request) -> ORJSONResponse:
+  name = _safe_inpc_filename(filename)
+  try:
+    payload = await request.json()
+  except Exception:
+    raise HTTPException(status_code=400, detail="JSON inválido")
+  flat = _flatten_inpc_payload(payload)
+  table = _parse_inpc_table(flat)
+  if not table:
+    raise HTTPException(status_code=400, detail="El archivo INPC no contiene meses válidos (YYYY-MM)")
+  path = _INPC_STORE_DIR / name
+  _INPC_STORE_DIR.mkdir(parents=True, exist_ok=True)
+  data = orjson.dumps(payload, option=orjson.OPT_INDENT_2)
+  tmp = path.with_suffix(path.suffix + ".tmp")
+  tmp.write_bytes(data)
+  os.replace(tmp, path)
+  return ORJSONResponse({"ok": True, "name": name, "saved": True})
+
+
+@app.delete("/api/config/inpc/{filename}")
+def delete_config_inpc_file(filename: str) -> ORJSONResponse:
+  name = _safe_inpc_filename(filename)
+  path = _INPC_STORE_DIR / name
+  if not path.exists() or not path.is_file():
+    raise HTTPException(status_code=404, detail="Archivo INPC no encontrado")
+  try:
+    os.remove(path)
+  except Exception as e:
+    raise HTTPException(status_code=500, detail=str(e))
+  return ORJSONResponse({"ok": True, "name": name, "deleted": True})
+
+
+@app.post("/api/config/inpc/upload")
+async def upload_config_inpc(file: UploadFile = File(...)) -> ORJSONResponse:
+  name = _safe_inpc_filename(file.filename or "")
+  raw = await file.read()
+  if not raw:
+    raise HTTPException(status_code=400, detail="Archivo vacío")
+  try:
+    payload = orjson.loads(raw)
+  except Exception:
+    raise HTTPException(status_code=400, detail="JSON inválido")
+  flat = _flatten_inpc_payload(payload)
+  table = _parse_inpc_table(flat)
+  if not table:
+    raise HTTPException(status_code=400, detail="El archivo INPC no contiene meses válidos (YYYY-MM)")
+  path = _INPC_STORE_DIR / name
+  _INPC_STORE_DIR.mkdir(parents=True, exist_ok=True)
+  data = orjson.dumps(payload, option=orjson.OPT_INDENT_2)
+  tmp = path.with_suffix(path.suffix + ".tmp")
+  tmp.write_bytes(data)
+  os.replace(tmp, path)
+  return ORJSONResponse({"ok": True, "name": name, "uploaded": True})
  
  
 @app.get("/api/fuentes")
@@ -7482,11 +7779,135 @@ def _meses_recargos(fecha_vencimiento: datetime, fecha_pago: datetime) -> int:
   if end_idx < start_idx:
     return 0
   months = (end_idx - start_idx) + 1
-  return int(max(0, min(60, months)))
+  return int(max(0, months))
 
 
 def _predial_bimestre(month: int) -> int:
   return ((int(month) - 1) // 2) + 1
+
+
+def _predial_bimestres_in_range(start_y: int, start_m: int, end_y: int, end_m: int) -> List[Tuple[int, int]]:
+  s_bim_end_m = max(1, min(12, int(((int(start_m) - 1) // 2) + 1) * 2))
+  e_bim_end_m = max(1, min(12, int(((int(end_m) - 1) // 2) + 1) * 2))
+  start_idx = _predial_ym_index(int(start_y), int(s_bim_end_m))
+  end_idx = _predial_ym_index(int(end_y), int(e_bim_end_m))
+  if end_idx < start_idx:
+    return []
+  out: List[Tuple[int, int]] = []
+  idx = start_idx
+  while idx <= end_idx:
+    y = idx // 12
+    m = (idx % 12) + 1
+    b = _predial_bimestre(m)
+    out.append((int(y), int(b)))
+    idx += 2
+  return out
+
+
+def _fetch_avaluos_al23(cve_fte_mt: str, predio_id: int, ejercicio_from: int, ejercicio_to: int) -> List[Dict[str, Any]]:
+  cve = str(cve_fte_mt or "MTULUM").strip() or "MTULUM"
+  pid = int(predio_id)
+  y1 = int(ejercicio_from)
+  y2 = int(ejercicio_to)
+  if y2 < y1:
+    y1, y2 = y2, y1
+  with get_conn() as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      DECLARE @CveFteMT varchar(32) = ?;
+      DECLARE @PredioId decimal(18,0) = ?;
+      DECLARE @FromEj smallint = ?;
+      DECLARE @ToEj smallint = ?;
+      SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+      SET LOCK_TIMEOUT 5000;
+      SELECT
+        a.SolicitudAvaluoId,
+        CAST(a.PredioId AS int) AS PredioId,
+        a.SolicitudAvaluoStatus,
+        a.SolicitudAvaluoAltaFecha,
+        CAST(a.SolicitudAvaluoEjercicioAvaluoActual AS int) AS Ejercicio,
+        CAST(COALESCE(a.SolicitudAvaluoCatastralImporte, 0) AS decimal(18,2)) AS CatastralImporte,
+        CAST(COALESCE(a.SolicitudAvaluoTasaImpuestoPredial, 0) AS decimal(18,8)) AS TasaPredial
+      FROM AL23SolicitudAvaluo a
+      WHERE a.CveFteMT = @CveFteMT
+        AND a.PredioId = @PredioId
+        AND a.SolicitudAvaluoStatus = 'A'
+        AND a.SolicitudAvaluoEjercicioAvaluoActual BETWEEN @FromEj AND @ToEj
+      ORDER BY a.SolicitudAvaluoEjercicioAvaluoActual ASC, a.SolicitudAvaluoAltaFecha ASC, a.SolicitudAvaluoId ASC
+      OPTION (RECOMPILE);
+      """,
+      (cve, pid, y1, y2),
+    )
+    return _rows(cur)
+
+
+def _avalue_effective_bim(ejercicio: int, alta_fecha: Any) -> int:
+  try:
+    if isinstance(alta_fecha, datetime):
+      dt = alta_fecha
+    else:
+      dt = datetime.fromisoformat(str(alta_fecha).replace("Z", "+00:00"))
+  except Exception:
+    return 1
+  y = int(ejercicio)
+  if dt.year < y:
+    return 1
+  if dt.year > y:
+    return 6
+  return max(1, min(6, _predial_bimestre(dt.month)))
+
+
+def _build_avaluo_bimestre_map(rows: List[Dict[str, Any]], ejercicio_from: int, ejercicio_to: int) -> Dict[Tuple[int, int], Dict[str, Any]]:
+  by_year: Dict[int, List[Dict[str, Any]]] = {}
+  for r in rows or []:
+    try:
+      y = int(r.get("Ejercicio"))
+    except Exception:
+      continue
+    by_year.setdefault(y, []).append(r)
+
+  out: Dict[Tuple[int, int], Dict[str, Any]] = {}
+  last_selected_row: Optional[Dict[str, Any]] = None
+  min_year = min(by_year.keys()) if by_year else int(ejercicio_from)
+  for y in range(int(min_year), int(ejercicio_to) + 1):
+    items = by_year.get(y) or []
+    enriched = []
+    for r in items:
+      eff_b = _avalue_effective_bim(y, r.get("SolicitudAvaluoAltaFecha"))
+      try:
+        aid = int(r.get("SolicitudAvaluoId"))
+      except Exception:
+        aid = 0
+      enriched.append((eff_b, r.get("SolicitudAvaluoAltaFecha"), aid, r))
+    enriched.sort(key=lambda t: (int(t[0]), str(t[1] or ""), int(t[2])))
+
+    chosen_for_b6: Optional[Dict[str, Any]] = None
+    for b in range(1, 7):
+      candidates = [t for t in enriched if int(t[0]) <= b]
+      chosen: Optional[Dict[str, Any]] = None
+      if candidates:
+        chosen = candidates[-1][3]
+      elif last_selected_row is not None:
+        chosen = last_selected_row
+      if chosen is None:
+        continue
+      if y >= int(ejercicio_from):
+        out[(y, b)] = {
+          "SolicitudAvaluoId": chosen.get("SolicitudAvaluoId"),
+          "SolicitudAvaluoAltaFecha": (
+            chosen.get("SolicitudAvaluoAltaFecha").isoformat()
+            if isinstance(chosen.get("SolicitudAvaluoAltaFecha"), datetime)
+            else chosen.get("SolicitudAvaluoAltaFecha")
+          ),
+          "SolicitudAvaluoCatastralImporte": str(_money(_dec(chosen.get("CatastralImporte")))),
+          "SolicitudAvaluoTasaImpuestoPredial": str(_dec(chosen.get("TasaPredial"))),
+        }
+      if b == 6:
+        chosen_for_b6 = chosen
+    if chosen_for_b6 is not None:
+      last_selected_row = chosen_for_b6
+  return out
 
 
 def _fetch_predio_alpredio(cve_fte_mt: str, predio_id: Optional[int], clave_catastral: Optional[str], clave_mode: str) -> Optional[Dict[str, Any]]:
@@ -7533,6 +7954,8 @@ def _fetch_predio_alpredio(cve_fte_mt: str, predio_id: Optional[int], clave_cata
         CAST(COALESCE(p.PredioConstruccionImporte, 0) AS decimal(18,2)) AS PredioConstruccionImporte,
         CAST(COALESCE(p.PredioCatastralImporte, 0) AS decimal(18,2)) AS PredioCatastralImporte,
         CAST(COALESCE(CAST(val.PredioValuoCatastralImporte AS decimal(18,2)), p.PredioCatastralImporte, 0) AS decimal(18,2)) AS PredioValuoCatastralImporte,
+        CAST(COALESCE(p.PredioUltimoEjericicioPagado, 0) AS int) AS PredioUltimoEjericicioPagado,
+        CAST(COALESCE(p.PredioUltimoPeriodoPagado, 0) AS int) AS PredioUltimoPeriodoPagado,
         val.PredioValuoCatastralEjercicio,
         val.PredioValuoCatastralFecha
       FROM AlPredio p
@@ -7555,7 +7978,13 @@ def _fetch_predio_alpredio(cve_fte_mt: str, predio_id: Optional[int], clave_cata
           @ClaveCatastral IS NULL OR
           (
             @ClaveMode = 'exacto'
-            AND RTRIM(COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '')) = @ClaveCatastral
+            AND (
+              RTRIM(COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '')) = @ClaveCatastral
+              OR (
+                RIGHT(@ClaveCatastral, 1) = '-'
+                AND RTRIM(COALESCE(CONVERT(varchar(80), p.PredioCveCatastral) COLLATE DATABASE_DEFAULT, '')) LIKE @ClaveCatastral + '%'
+              )
+            )
           )
           OR (
             @ClaveMode <> 'exacto'
@@ -7607,17 +8036,51 @@ async def cajas_predial_pase_preview(request: Request) -> ORJSONResponse:
 
   periodo_inicio = (body or {}).get("periodoInicio")
   periodo_fin = (body or {}).get("periodoFin")
-  start_y, start_m = _parse_year_month(periodo_inicio, "periodoInicio")
+  start_y_in, start_m_in = _parse_year_month(periodo_inicio, "periodoInicio")
   end_y, end_m = _parse_year_month(periodo_fin, "periodoFin")
-  if _predial_ym_index(end_y, end_m) < _predial_ym_index(start_y, start_m):
+  warnings: List[str] = []
+  now_local = datetime.now()
+  current_year = int(now_local.year)
+  adelanto_activo = _normalize_bool(os.getenv("PREDIAL_ADELANTO_ACTIVO"), fallback=False)
+  allowed_end_year = current_year + (1 if adelanto_activo else 0)
+  if end_y > allowed_end_year:
+    warnings.append(
+      f"El periodo final se ajustó al año permitido ({allowed_end_year}) porque el año capturado ({end_y}) no es válido."
+    )
+    end_y = allowed_end_year
+    end_m = 12
+  if _predial_ym_index(end_y, end_m) < _predial_ym_index(start_y_in, start_m_in):
     raise HTTPException(status_code=400, detail="periodoInicio debe ser <= periodoFin")
 
-  pay_y, pay_m = fecha_pago.year, fecha_pago.month
-  if _predial_ym_index(end_y, end_m) > _predial_ym_index(pay_y, pay_m):
-    end_y, end_m = pay_y, pay_m
+  start_b_in = _predial_bimestre(start_m_in)
+  start_y = int(start_y_in)
+  start_b = int(start_b_in) + 1
+  if start_b > 6:
+    start_b = 1
+    start_y += 1
+  start_m = ((start_b - 1) * 2) + 1
+  if _predial_ym_index(end_y, end_m) < _predial_ym_index(start_y, start_m):
+    warnings.append("Sin adeudo: el periodo final es menor o igual al último periodo pagado.")
 
-  tasas_recargos = _parse_tasas_recargos((body or {}).get("tasasRecargos"))
-  tabla_inpc = _parse_inpc_table((body or {}).get("tablaINPC"))
+  pay_y, pay_m = fecha_pago.year, fecha_pago.month
+
+  tasas_recargos: Dict[int, decimal.Decimal] = {}
+  recargos_source: Optional[str] = None
+  tasas_raw = (body or {}).get("tasasRecargos")
+  if tasas_raw is not None:
+    tasas_recargos = _parse_tasas_recargos(tasas_raw)
+  else:
+    with _RECARGOS_STORE_LOCK:
+      tasas_recargos = dict(RECARGOS_MORA_BY_YEAR)
+    recargos_source = _RECARGOS_STORE_PATH.name
+  tabla_inpc: Dict[int, decimal.Decimal] = {}
+  inpc_sources: List[str] = []
+  tabla_inpc_raw = (body or {}).get("tablaINPC")
+  if tabla_inpc_raw is not None:
+    tabla_inpc = _parse_inpc_table(tabla_inpc_raw)
+  else:
+    with _INPC_STORE_LOCK:
+      tabla_inpc, inpc_sources = _load_inpc_table_from_disk()
 
   dia_vencimiento_raw = (body or {}).get("diaVencimiento")
   try:
@@ -7633,14 +8096,17 @@ async def cajas_predial_pase_preview(request: Request) -> ORJSONResponse:
 
   tasa_al_millar_raw = (body or {}).get("tasaAlMillar")
   tasa_al_millar = _dec(tasa_al_millar_raw)
-  if tasa_al_millar <= 0:
-    raise HTTPException(status_code=400, detail="tasaAlMillar inválida")
 
   predio: Optional[Dict[str, Any]] = None
   if predio_id is not None or clave:
     predio = _fetch_predio_alpredio(cve_fte_mt, predio_id, clave, clave_mode)
     if not predio:
       raise HTTPException(status_code=404, detail="Predio no encontrado")
+    if predio_id is None:
+      try:
+        predio_id = int(predio.get("PredioId")) if predio.get("PredioId") is not None else None
+      except Exception:
+        predio_id = None
 
   valor_catastral_raw = (body or {}).get("valorCatastral")
   valor_catastral = _dec(valor_catastral_raw) if valor_catastral_raw not in (None, "", "null") else None
@@ -7653,12 +8119,29 @@ async def cajas_predial_pase_preview(request: Request) -> ORJSONResponse:
     raise HTTPException(status_code=400, detail="valorCatastral inválido")
 
   impuesto_anual = monto_anual
-  if impuesto_anual is None:
+  base_calculo = "montoAnual"
+  avaluo_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
+  if impuesto_anual is None and predio_id is not None:
+    try:
+      avaluos = _fetch_avaluos_al23(cve_fte_mt, int(predio_id), 1900, int(end_y))
+      avaluo_map = _build_avaluo_bimestre_map(avaluos, int(start_y), int(end_y))
+    except Exception:
+      avaluo_map = {}
+    if avaluo_map:
+      base_calculo = "AL23SolicitudAvaluo"
+      missing = []
+      for yy, bb in _predial_bimestres_in_range(int(start_y), int(start_m), int(end_y), int(end_m)):
+        if (int(yy), int(bb)) not in avaluo_map:
+          missing.append(f"{int(yy)}-B{int(bb)}")
+      if missing:
+        raise HTTPException(status_code=400, detail=f"Falta avalúo vigente (AL23SolicitudAvaluo) para: {', '.join(missing[:30])}")
+  if impuesto_anual is None and not avaluo_map:
+    base_calculo = "valorCatastral"
+    if tasa_al_millar <= 0:
+      raise HTTPException(status_code=400, detail="tasaAlMillar inválida")
     if not valor_catastral or valor_catastral <= 0:
       raise HTTPException(status_code=400, detail="No se pudo determinar el valor catastral / monto anual")
     impuesto_anual = (valor_catastral * (tasa_al_millar / decimal.Decimal("1000")))
-
-  cuota_mensual = impuesto_anual / decimal.Decimal("12")
 
   inpc_pago_key, inpc_pago = (None, None)
   if tabla_inpc:
@@ -7670,64 +8153,86 @@ async def cajas_predial_pase_preview(request: Request) -> ORJSONResponse:
   total_recargos = decimal.Decimal("0")
   total_pagar = decimal.Decimal("0")
 
-  for y, m in _predial_months_in_range(start_y, start_m, end_y, end_m):
-    fecha_venc = _predial_safe_date(y, m, dia_vencimiento)
-    cuota_orig = _money(cuota_mensual)
+  bimestres = _predial_bimestres_in_range(start_y, start_m, end_y, end_m) if _predial_ym_index(end_y, end_m) >= _predial_ym_index(start_y, start_m) else []
+  start_idx = _predial_ym_index(int(start_y), int(start_m))
+  end_idx = _predial_ym_index(int(end_y), int(end_m))
+  if end_idx >= start_idx:
+    idx = start_idx
+    while idx <= end_idx:
+      y = int(idx // 12)
+      m = int((idx % 12) + 1)
+      b = int(_predial_bimestre(m))
+      fecha_venc = _predial_safe_date(y, m, dia_vencimiento)
+      avaluo_info = avaluo_map.get((int(y), int(b))) if avaluo_map else None
 
-    status = "con_adeudo"
-    if fecha_pago.date() < fecha_venc.date():
-      status = "no_vencido"
-    elif fecha_pago.date() == fecha_venc.date():
-      status = "en_tiempo"
+      cuota_mensual: Optional[decimal.Decimal] = None
+      if base_calculo == "AL23SolicitudAvaluo" and avaluo_info:
+        base_imp = _dec(avaluo_info.get("SolicitudAvaluoCatastralImporte"))
+        tasa_imp = _dec(avaluo_info.get("SolicitudAvaluoTasaImpuestoPredial"))
+        anual = base_imp * tasa_imp
+        cuota_mensual = anual / decimal.Decimal("12")
+      elif impuesto_anual is not None:
+        cuota_mensual = impuesto_anual / decimal.Decimal("12")
+      if cuota_mensual is None:
+        cuota_mensual = decimal.Decimal("0")
+      cuota_orig = _money(cuota_mensual)
 
-    inpc_v_key, inpc_v = (None, None)
-    if tabla_inpc:
-      inpc_v_key, inpc_v = _obtener_inpc_mes_anterior(fecha_venc, tabla_inpc)
+      status = "con_adeudo"
+      if fecha_pago.date() < fecha_venc.date():
+        status = "no_vencido"
+      elif fecha_pago.date() == fecha_venc.date():
+        status = "en_tiempo"
 
-    factor = decimal.Decimal("1")
-    meses_recargo = 0
-    if status == "con_adeudo":
-      factor = _factor_actualizacion(inpc_pago, inpc_v) if (inpc_pago and inpc_v) else decimal.Decimal("1")
-      meses_recargo = _meses_recargos(fecha_venc, fecha_pago)
+      inpc_v_key, inpc_v = (None, None)
+      if tabla_inpc:
+        inpc_v_key, inpc_v = _obtener_inpc_mes_anterior(fecha_venc, tabla_inpc)
 
-    monto_act = _money(cuota_orig * factor)
-    imp_act = _money(monto_act - cuota_orig) if status == "con_adeudo" else decimal.Decimal("0.00")
+      factor = decimal.Decimal("1")
+      meses_recargo = 0
+      if status == "con_adeudo":
+        factor = _factor_actualizacion(inpc_pago, inpc_v) if (inpc_pago and inpc_v) else decimal.Decimal("1")
+        meses_recargo = _meses_recargos(fecha_venc, fecha_pago)
 
-    tasa = tasas_recargos.get(int(y)) if tasas_recargos else None
-    if tasa is None:
-      tasa = decimal.Decimal("0")
+      monto_act = _money(cuota_orig * factor)
+      imp_act = _money(monto_act - cuota_orig) if status == "con_adeudo" else decimal.Decimal("0.00")
 
-    recargos = decimal.Decimal("0.00")
-    if status == "con_adeudo" and meses_recargo > 0:
-      recargos = _money(monto_act * tasa * decimal.Decimal(str(meses_recargo)))
-    subtotal = _money(monto_act + recargos)
+      tasa = _recargo_mora_rate_for_year(int(y), tasas_recargos)
 
-    total_original += cuota_orig
-    total_actualizacion += imp_act
-    total_recargos += recargos
-    total_pagar += subtotal
+      recargos = decimal.Decimal("0.00")
+      if status == "con_adeudo" and meses_recargo > 0:
+        recargos = _money(monto_act * tasa * decimal.Decimal(str(meses_recargo)))
+      subtotal = _money(monto_act + recargos)
 
-    desglose_mensual.append(
-      {
-        "mes_label": f"{_MONTH_NAMES_ES[m-1]} {y}",
-        "mes": int(m),
-        "anio": int(y),
-        "fecha_vencimiento": fecha_venc.date().isoformat(),
-        "cuota_original": float(cuota_orig),
-        "inpc_vencimiento_key": inpc_v_key,
-        "inpc_vencimiento": (float(inpc_v) if inpc_v is not None else None),
-        "inpc_pago_key": inpc_pago_key,
-        "inpc_pago": (float(inpc_pago) if inpc_pago is not None else None),
-        "factor_actualizacion": float(_money(factor)),
-        "monto_actualizado": float(monto_act),
-        "importe_actualizacion": float(imp_act),
-        "meses_recargo": int(meses_recargo),
-        "tasa_recargos": float(tasa),
-        "importe_recargos": float(recargos),
-        "subtotal": float(subtotal),
-        "status": status,
-      }
-    )
+      total_original += cuota_orig
+      total_actualizacion += imp_act
+      total_recargos += recargos
+      total_pagar += subtotal
+
+      label = f"{_MONTH_NAMES_ES[m-1]} {y}"
+      desglose_mensual.append(
+        {
+          "mes_label": label,
+          "mes": int(m),
+          "anio": int(y),
+          "bimestre_numero": int(b),
+          "fecha_vencimiento": fecha_venc.date().isoformat(),
+          "cuota_original": float(cuota_orig),
+          "inpc_vencimiento_key": inpc_v_key,
+          "inpc_vencimiento": (float(inpc_v) if inpc_v is not None else None),
+          "inpc_pago_key": inpc_pago_key,
+          "inpc_pago": (float(inpc_pago) if inpc_pago is not None else None),
+          "factor_actualizacion": float(_money(factor)),
+          "monto_actualizado": float(monto_act),
+          "importe_actualizacion": float(imp_act),
+          "meses_recargo": int(meses_recargo),
+          "tasa_recargos": float(tasa),
+          "importe_recargos": float(recargos),
+          "subtotal": float(subtotal),
+          "status": status,
+          "avaluo": avaluo_info,
+        }
+      )
+      idx += 1
 
   grouped: Dict[str, Dict[str, Any]] = {}
   for item in desglose_mensual:
@@ -7778,13 +8283,18 @@ async def cajas_predial_pase_preview(request: Request) -> ORJSONResponse:
       "cveFteMT": cve_fte_mt,
       "predioId": int(predio.get("PredioId")) if predio and predio.get("PredioId") is not None else predio_id,
       "claveCatastral": (predio.get("PredioCveCatastral") if predio else (clave or "")) or "",
-      "monto_anual": float(_money(impuesto_anual)),
-      "cuota_mensual": float(_money(cuota_mensual)),
+      "base_calculo": base_calculo,
+      "monto_anual": (float(_money(impuesto_anual)) if impuesto_anual is not None else None),
       "periodo_inicio": {"mes": int(start_m), "anio": int(start_y)},
+      "periodo_inicio_capturado": {"mes": int(start_m_in), "anio": int(start_y_in)},
       "periodo_fin": {"mes": int(end_m), "anio": int(end_y)},
       "fecha_pago": fecha_pago.date().isoformat(),
       "fecha_vencimiento_dia": int(dia_vencimiento),
       "total_meses_calculados": int(len(desglose_mensual)),
+      "inpc_sources": inpc_sources,
+      "recargos_source": recargos_source,
+      "adelanto_activo": adelanto_activo,
+      "warnings": warnings,
     },
     "desglose_mensual": desglose_mensual,
     "desglose_bimestral": desglose_bimestral,

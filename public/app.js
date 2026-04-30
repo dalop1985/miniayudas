@@ -943,15 +943,24 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
       periodoInicioAnio: String(yyyy),
       periodoFinMes: String(d.getMonth() + 1),
       periodoFinAnio: String(yyyy),
+      ejercicioInicial: String(yyyy),
+      periodoInicial: "1",
+      ejercicioFinal: String(yyyy),
+      periodoFinal: String(Math.max(1, Math.min(6, Math.ceil((d.getMonth() + 1) / 2)))),
       fechaPago: `${yyyy}-${mm}-${dd}`,
-      tasasRecargosJson: `{\n  \"${yyyy}\": 0.015\n}`,
-      tablaINPCJson: "{}"
     };
   });
   const [cajaPredialPredio, setCajaPredialPredio] = useState(null);
   const [cajaPredialPreview, setCajaPredialPreview] = useState(null);
   const [cajaPredialSearchTime, setCajaPredialSearchTime] = useState(null);
   const [cajaPredialError, setCajaPredialError] = useState("");
+  const [cajaPredialWarnings, setCajaPredialWarnings] = useState([]);
+  const [cajaPredialPaseNotas, setCajaPredialPaseNotas] = useState({
+    fechaUltimoPago: "",
+    folioRecibo: "",
+    importePagado: "",
+    notas: ""
+  });
   const [criReport, setCriReport] = useState({
     reporte: "estado",
     idEnte: "",
@@ -1011,6 +1020,19 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
   const [factusRows, setFactusRows] = useState([]);
   const [umaRows, setUmaRows] = useState([]);
   const [umaForm, setUmaForm] = useState({ vigenciaYear: "2025", umaMxn: "" });
+  const [recargosRows, setRecargosRows] = useState([]);
+  const [recargosForm, setRecargosForm] = useState(() => ({ year: String(new Date().getFullYear()), tasaMora: "" }));
+  const [recargosError, setRecargosError] = useState("");
+  const [inpcFiles, setInpcFiles] = useState([]);
+  const [inpcEditorName, setInpcEditorName] = useState("");
+  const [inpcEditorText, setInpcEditorText] = useState("");
+  const [inpcEditorError, setInpcEditorError] = useState("");
+  const [inpcHistoricoFileData, setInpcHistoricoFileData] = useState(null);
+  const [inpcHistoricoYearRows, setInpcHistoricoYearRows] = useState([]);
+  const [inpcHistoricoForm, setInpcHistoricoForm] = useState(() => {
+    const m = new Date().getMonth() + 1;
+    return { month: String(m), value: "" };
+  });
   const [configSection, setConfigSection] = useState("umas");
   const [criCatalog, setCriCatalog] = useState(null);
   const [output, setOutput] = useState(null);
@@ -1124,6 +1146,9 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
       }),
     []
   );
+  const monthNamesEs = useMemo(() => {
+    return ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+  }, []);
   const numberMx = useMemo(
     () =>
       new Intl.NumberFormat("es-MX", {
@@ -1287,8 +1312,9 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     setCajaPredialError("");
     setCajaPredialPreview(null);
     const predioId = String(cajaPredialForm.predioId || "").trim();
-    if (!predioId) {
-      setCajaPredialError("Captura el PredioId.");
+    const claveCatastral = String(cajaPredialForm.claveCatastral || "").trim();
+    if (!predioId && !claveCatastral) {
+      setCajaPredialError("Captura el PredioId o la clave catastral.");
       return;
     }
 
@@ -1296,7 +1322,9 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     const t0 = performance.now();
     try {
       const query = new URLSearchParams({ cveFteMT: cajaPredialForm.cveFteMT || "MTULUM" });
-      query.set("predioId", predioId);
+      if (predioId) query.set("predioId", predioId);
+      if (claveCatastral) query.set("claveCatastral", claveCatastral);
+      query.set("claveMode", cajaPredialForm.claveMode || "exacto");
       const response = await fetch(`/api/cajas/predial/predio?${query.toString()}`);
       const json = await response.json().catch(() => null);
       const t1 = performance.now();
@@ -1308,6 +1336,20 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         return;
       }
       setCajaPredialPredio(json.predio || null);
+      const predio = json.predio || null;
+      if (predio) {
+        const ejerc = Number(predio.PredioUltimoEjericicioPagado) || new Date().getFullYear();
+        const peri = Math.max(1, Math.min(6, Number(predio.PredioUltimoPeriodoPagado) || 1));
+        setCajaPredialForm((prev) => ({
+          ...prev,
+          predioId: String(predio.PredioId ?? prev.predioId ?? ""),
+          claveCatastral: String(predio.PredioCveCatastral ?? prev.claveCatastral ?? ""),
+          ejercicioInicial: String(ejerc),
+          periodoInicial: String(peri),
+          ejercicioFinal: String(ejerc),
+          periodoFinal: String(peri)
+        }));
+      }
       setOutput(json);
     } catch (error) {
       setCajaPredialPredio(null);
@@ -1321,30 +1363,28 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
 
   async function cajasVistaPreviaPredial() {
     setCajaPredialError("");
+    setCajaPredialWarnings([]);
     setCajaPredialPreview(null);
     const t0 = performance.now();
-    let tasasRecargos = null;
-    let tablaINPC = null;
-    try {
-      tasasRecargos = parseJsonIfPresent(cajaPredialForm.tasasRecargosJson, "Tasas de recargos");
-      tablaINPC = parseJsonIfPresent(cajaPredialForm.tablaINPCJson, "Tabla INPC");
-    } catch (e) {
-      setCajaPredialError(e.message || "JSON inválido.");
-      return;
-    }
-
     setLoading("cajas_preview");
     try {
+      const ejIni = Number(cajaPredialForm.ejercicioInicial);
+      const perIni = Number(cajaPredialForm.periodoInicial);
+      const ejFin = Number(cajaPredialForm.ejercicioFinal);
+      const perFin = Number(cajaPredialForm.periodoFinal);
+      const startMonth = Number.isFinite(perIni) ? (Math.max(1, Math.min(6, perIni)) - 1) * 2 + 1 : 1;
+      const endMonth = Number.isFinite(perFin) ? Math.max(1, Math.min(6, perFin)) * 2 : 2;
+
       const payload = {
         cveFteMT: cajaPredialForm.cveFteMT || "MTULUM",
         predioId: cajaPredialForm.predioId ? Number(cajaPredialForm.predioId) : undefined,
+        claveCatastral: cajaPredialForm.claveCatastral || undefined,
+        claveMode: cajaPredialForm.claveMode || "exacto",
         tasaAlMillar: Number(cajaPredialForm.tasaAlMillar),
         diaVencimiento: Number(cajaPredialForm.diaVencimiento),
         fechaPago: cajaPredialForm.fechaPago,
-        periodoInicio: { mes: Number(cajaPredialForm.periodoInicioMes), anio: Number(cajaPredialForm.periodoInicioAnio) },
-        periodoFin: { mes: Number(cajaPredialForm.periodoFinMes), anio: Number(cajaPredialForm.periodoFinAnio) },
-        tasasRecargos: tasasRecargos || undefined,
-        tablaINPC: tablaINPC || undefined,
+        periodoInicio: { mes: startMonth, anio: ejIni },
+        periodoFin: { mes: endMonth, anio: ejFin },
         valorCatastral: cajaPredialPredio?.PredioValuoCatastralImporte ?? cajaPredialPredio?.PredioCatastralImporte ?? undefined
       };
 
@@ -1363,6 +1403,16 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         return;
       }
       setCajaPredialPreview(json);
+      const warns = json?.parametros?.warnings;
+      setCajaPredialWarnings(Array.isArray(warns) ? warns : []);
+      const pf = json?.parametros?.periodo_fin;
+      if (pf && Number.isFinite(Number(pf.anio)) && Number.isFinite(Number(pf.mes))) {
+        const endYear = String(Number(pf.anio));
+        const endPer = String(Math.max(1, Math.min(6, Math.ceil(Number(pf.mes) / 2))));
+        if (endYear !== String(cajaPredialForm.ejercicioFinal) || endPer !== String(cajaPredialForm.periodoFinal)) {
+          setCajaPredialForm((prev) => ({ ...prev, ejercicioFinal: endYear, periodoFinal: endPer }));
+        }
+      }
       setOutput(json);
     } catch (error) {
       setCajaPredialPreview(null);
@@ -1371,6 +1421,58 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
       setOutput({ ok: false, error: error.message });
     } finally {
       setLoading("");
+    }
+  }
+
+  function updateCajaPredialPaseNota(event) {
+    const { name, value } = event.target;
+    setCajaPredialPaseNotas((prev) => ({ ...prev, [name]: value }));
+  }
+
+  function _nextPeriodoFromUltimoPagado(ejercicio, periodo) {
+    const y = Number(ejercicio);
+    const p = Number(periodo);
+    if (!Number.isFinite(y) || !Number.isFinite(p) || p < 1 || p > 6) {
+      return { ejercicio: String(new Date().getFullYear()), periodo: "1" };
+    }
+    const nextP = p + 1;
+    if (nextP <= 6) return { ejercicio: String(y), periodo: String(nextP) };
+    return { ejercicio: String(y + 1), periodo: "1" };
+  }
+
+  function _nextCorteVencimientoPaseYmd(baseDate, cutoffDay) {
+    const d = baseDate instanceof Date ? baseDate : new Date(baseDate);
+    const day = Number(cutoffDay);
+    const cutoff = Number.isFinite(day) ? Math.max(1, Math.min(28, day)) : 17;
+    const yyyy = d.getFullYear();
+    const mm = d.getMonth() + 1;
+    const useMonth = d.getDate() < cutoff ? mm : (mm === 12 ? 1 : mm + 1);
+    const useYear = d.getDate() < cutoff ? yyyy : (mm === 12 ? yyyy + 1 : yyyy);
+    return _formatYmdLocal(new Date(useYear, useMonth - 1, cutoff));
+  }
+
+  function _formatYmdLocal(d) {
+    const dt = d instanceof Date ? d : new Date(d);
+    const yyyy = dt.getFullYear();
+    const mm = String(dt.getMonth() + 1).padStart(2, "0");
+    const dd = String(dt.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function abrirVisualizacionPase({ imprimir }) {
+    const el = document.getElementById("predial-invoice");
+    if (!el) return;
+    const html = String(el.innerHTML || "");
+    const win = window.open("", "_blank");
+    if (!win) return;
+    win.document.open();
+    win.document.write(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Pase de caja</title><link rel="stylesheet" href="/styles.css"/><style>body{margin:0;background:#fff}.panel{box-shadow:none;border:0} .admin-shell{background:#fff}</style></head><body><section class="panel invoice-panel">${html}</section></body></html>`);
+    win.document.close();
+    if (imprimir) {
+      win.focus();
+      setTimeout(() => {
+        try { win.print(); } catch {}
+      }, 250);
     }
   }
 
@@ -2134,6 +2236,401 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     }
   }
 
+  async function loadRecargos() {
+    setRecargosError("");
+    setLoading("recargos");
+    setOutput("Cargando recargos...");
+    try {
+      const response = await fetch("/api/config/recargos");
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setRecargosRows([]);
+        setRecargosError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setRecargosRows(Array.isArray(json.items) ? json.items : []);
+      setOutput(json);
+    } catch (error) {
+      setRecargosRows([]);
+      setRecargosError(error.message || "No se pudo cargar recargos.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function updateRecargosField(event) {
+    const { name, value } = event.target;
+    setRecargosForm((prev) => ({ ...prev, [name]: value }));
+  }
+
+  async function saveRecargo() {
+    const year = Number(recargosForm.year);
+    const tasa = Number(recargosForm.tasaMora);
+    if (!Number.isFinite(year) || year < 1900 || year > 2200) return;
+    if (!Number.isFinite(tasa) || tasa <= 0) {
+      setRecargosError("tasaMora inválida.");
+      return;
+    }
+    setRecargosError("");
+    setLoading("recargos-save");
+    setOutput("Guardando recargo...");
+    try {
+      const response = await fetch("/api/config/recargos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ year, tasaMora: tasa })
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setRecargosError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      await loadRecargos();
+    } catch (error) {
+      setRecargosError(error.message || "No se pudo guardar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function editRecargoRow(row) {
+    if (!row) return;
+    setRecargosForm({
+      year: String(row.year ?? ""),
+      tasaMora: row.tasaMora == null ? "" : String(row.tasaMora)
+    });
+  }
+
+  async function deleteRecargoRow(yearValue) {
+    const year = Number(yearValue);
+    if (!Number.isFinite(year)) return;
+    if (!window.confirm(`¿Eliminar recargo (mora) para ${year}?`)) return;
+    setRecargosError("");
+    setLoading("recargos-delete");
+    setOutput("Eliminando recargo...");
+    try {
+      const response = await fetch("/api/config/recargos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ year, tasaMora: null })
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setRecargosError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      await loadRecargos();
+    } catch (error) {
+      setRecargosError(error.message || "No se pudo eliminar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function loadInpcFiles() {
+    setInpcEditorError("");
+    setLoading("inpc");
+    setOutput("Cargando INPC...");
+    try {
+      const response = await fetch("/api/config/inpc");
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcFiles([]);
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setInpcFiles(Array.isArray(json.items) ? json.items : []);
+      setOutput(json);
+    } catch (error) {
+      setInpcFiles([]);
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function buildInpcYearRows(payload, yearNumber) {
+    const y = Number(yearNumber);
+    if (!payload || typeof payload !== "object") return [];
+    const inpcHistorico = payload.inpc_historico && typeof payload.inpc_historico === "object" ? payload.inpc_historico : null;
+    const yearBucket = inpcHistorico && typeof inpcHistorico[String(y)] === "object" ? inpcHistorico[String(y)] : null;
+    if (!yearBucket) return [];
+    const rows = [];
+    for (let month = 1; month <= 12; month += 1) {
+      const mm = String(month).padStart(2, "0");
+      const key = `${String(y)}-${mm}`;
+      const value = yearBucket[key];
+      if (value == null || value === "") continue;
+      const n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      rows.push({ key, year: y, month, monthLabel: monthNamesEs[month - 1], value: n });
+    }
+    rows.sort((a, b) => a.month - b.month);
+    return rows;
+  }
+
+  async function loadInpcHistoricoCurrentYear() {
+    const currentYear = new Date().getFullYear();
+    setInpcEditorError("");
+    setLoading("inpc-historico");
+    setOutput("Cargando INPC (año corriente)...");
+    try {
+      const response = await fetch("/api/config/inpc/inpc_historico.json");
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcHistoricoFileData(null);
+        setInpcHistoricoYearRows([]);
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      const data = json.data || null;
+      setInpcHistoricoFileData(data);
+      setInpcHistoricoYearRows(buildInpcYearRows(data, currentYear));
+      setOutput(json);
+    } catch (error) {
+      setInpcHistoricoFileData(null);
+      setInpcHistoricoYearRows([]);
+      setInpcEditorError(error.message || "No se pudo cargar INPC histórico.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function updateInpcHistoricoField(event) {
+    const { name, value } = event.target;
+    setInpcHistoricoForm((prev) => ({ ...prev, [name]: value }));
+  }
+
+  async function saveInpcHistoricoMonth() {
+    const currentYear = new Date().getFullYear();
+    const month = Number(inpcHistoricoForm.month);
+    const value = Number(inpcHistoricoForm.value);
+    if (!Number.isFinite(month) || month < 1 || month > 12) return;
+    if (!Number.isFinite(value) || value <= 0) {
+      setInpcEditorError("INPC inválido.");
+      return;
+    }
+    if (!inpcHistoricoFileData || typeof inpcHistoricoFileData !== "object") {
+      setInpcEditorError("No se pudo cargar inpc_historico.json.");
+      return;
+    }
+
+    const mm = String(month).padStart(2, "0");
+    const monthKey = `${String(currentYear)}-${mm}`;
+    const next = JSON.parse(JSON.stringify(inpcHistoricoFileData));
+    if (!next.inpc_historico || typeof next.inpc_historico !== "object") next.inpc_historico = {};
+    if (!next.inpc_historico[String(currentYear)] || typeof next.inpc_historico[String(currentYear)] !== "object") next.inpc_historico[String(currentYear)] = {};
+    next.inpc_historico[String(currentYear)][monthKey] = value;
+
+    setInpcEditorError("");
+    setLoading("inpc-historico-save");
+    setOutput("Guardando INPC...");
+    try {
+      const response = await fetch("/api/config/inpc/inpc_historico.json", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next)
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      setInpcHistoricoForm((prev) => ({ ...prev, value: "" }));
+      await loadInpcHistoricoCurrentYear();
+    } catch (error) {
+      setInpcEditorError(error.message || "No se pudo guardar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function editInpcHistoricoRow(row) {
+    if (!row) return;
+    setInpcHistoricoForm({ month: String(row.month), value: row.value == null ? "" : String(row.value) });
+  }
+
+  async function deleteInpcHistoricoMonth(monthNumber) {
+    const currentYear = new Date().getFullYear();
+    const month = Number(monthNumber);
+    if (!Number.isFinite(month) || month < 1 || month > 12) return;
+    const mm = String(month).padStart(2, "0");
+    const monthKey = `${String(currentYear)}-${mm}`;
+    if (!window.confirm(`¿Eliminar INPC de ${monthNamesEs[month - 1]} ${currentYear}?`)) return;
+    if (!inpcHistoricoFileData || typeof inpcHistoricoFileData !== "object") return;
+
+    const next = JSON.parse(JSON.stringify(inpcHistoricoFileData));
+    if (next.inpc_historico && next.inpc_historico[String(currentYear)] && typeof next.inpc_historico[String(currentYear)] === "object") {
+      delete next.inpc_historico[String(currentYear)][monthKey];
+      const keys = Object.keys(next.inpc_historico[String(currentYear)] || {});
+      if (!keys.length) delete next.inpc_historico[String(currentYear)];
+    }
+
+    setInpcEditorError("");
+    setLoading("inpc-historico-delete");
+    setOutput("Eliminando INPC...");
+    try {
+      const response = await fetch("/api/config/inpc/inpc_historico.json", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next)
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      await loadInpcHistoricoCurrentYear();
+    } catch (error) {
+      setInpcEditorError(error.message || "No se pudo eliminar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function uploadInpcFile(event) {
+    const file = event?.target?.files?.[0];
+    if (!file) return;
+    setInpcEditorError("");
+    setLoading("inpc-upload");
+    setOutput("Subiendo INPC...");
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch("/api/config/inpc/upload", { method: "POST", body: formData });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      await loadInpcFiles();
+      await loadInpcHistoricoCurrentYear();
+    } catch (error) {
+      setInpcEditorError(error.message || "No se pudo subir el archivo.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+      try {
+        event.target.value = "";
+      } catch (_e) {}
+    }
+  }
+
+  async function editInpcFile(name) {
+    const filename = String(name || "").trim();
+    if (!filename) return;
+    setInpcEditorError("");
+    setLoading("inpc-edit");
+    setOutput("Cargando archivo INPC...");
+    try {
+      const response = await fetch(`/api/config/inpc/${encodeURIComponent(filename)}`);
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorName("");
+        setInpcEditorText("");
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setInpcEditorName(json.name || filename);
+      setInpcEditorText(JSON.stringify(json.data || {}, null, 2));
+      setOutput(json);
+    } catch (error) {
+      setInpcEditorName("");
+      setInpcEditorText("");
+      setInpcEditorError(error.message || "No se pudo cargar el archivo.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function saveInpcFile() {
+    const filename = String(inpcEditorName || "").trim();
+    if (!filename) return;
+    setInpcEditorError("");
+    let payload = null;
+    try {
+      payload = JSON.parse(String(inpcEditorText || ""));
+    } catch (e) {
+      setInpcEditorError("JSON inválido.");
+      return;
+    }
+    setLoading("inpc-save");
+    setOutput("Guardando INPC...");
+    try {
+      const response = await fetch(`/api/config/inpc/${encodeURIComponent(filename)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      setInpcEditorName("");
+      setInpcEditorText("");
+      await loadInpcFiles();
+      await loadInpcHistoricoCurrentYear();
+    } catch (error) {
+      setInpcEditorError(error.message || "No se pudo guardar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function deleteInpcFile(name) {
+    const filename = String(name || "").trim();
+    if (!filename) return;
+    if (!window.confirm(`¿Eliminar archivo INPC ${filename}?`)) return;
+    setInpcEditorError("");
+    setLoading("inpc-delete");
+    setOutput("Eliminando INPC...");
+    try {
+      const response = await fetch(`/api/config/inpc/${encodeURIComponent(filename)}`, { method: "DELETE" });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setInpcEditorError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      if (String(inpcEditorName || "") === filename) {
+        setInpcEditorName("");
+        setInpcEditorText("");
+      }
+      await loadInpcFiles();
+      await loadInpcHistoricoCurrentYear();
+    } catch (error) {
+      setInpcEditorError(error.message || "No se pudo eliminar.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLoading("");
+    }
+  }
+
   async function loadCri() {
     setLoading("cri");
     setOutput("Cargando CRI...");
@@ -2848,7 +3345,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
 
   function renderPredialPaseCaja() {
     return (
-      <div>
+      <div className="pase-predial">
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -2860,151 +3357,337 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
             </div>
           </div>
 
-          <div className="grid">
+          <div className="pase-search-row">
             <Field label="CveFteMT">
               <input name="cveFteMT" value={cajaPredialForm.cveFteMT} onChange={updateCajaPredialField} placeholder="MTULUM" />
             </Field>
-            <Field label="PredioId" hint="Búsqueda por AlPredio.PredioId">
+            <Field label="PredioId">
               <input name="predioId" value={cajaPredialForm.predioId} onChange={updateCajaPredialField} inputMode="numeric" placeholder="12345" />
             </Field>
-          </div>
-
-          <div className="actions">
-            <button className="primary" type="button" onClick={cajasBuscarPredio} disabled={loading === "cajas_predio"}>
-              {loading === "cajas_predio" ? "Buscando..." : "Buscar predio"}
-            </button>
+            <Field label="Clave catastral">
+              <input
+                name="claveCatastral"
+                value={cajaPredialForm.claveCatastral}
+                onChange={updateCajaPredialField}
+                placeholder="109001000001049-1"
+              />
+            </Field>
+            <Field label="Modo clave">
+              <select name="claveMode" value={cajaPredialForm.claveMode} onChange={updateCajaPredialField}>
+                <option value="exacto">Exacto</option>
+                <option value="contiene">Contiene</option>
+              </select>
+            </Field>
+            <div className="pase-search-actions">
+              <button className="primary" type="button" onClick={cajasBuscarPredio} disabled={loading === "cajas_predio"}>
+                {loading === "cajas_predio" ? "Buscando..." : "Buscar predio"}
+              </button>
+            </div>
           </div>
 
           {cajaPredialError ? <div className="empty">{cajaPredialError}</div> : null}
-
-          {cajaPredialPredio ? (
-            <div className="connection-list">
-              <div><span>PredioId</span><strong>{String(cajaPredialPredio.PredioId ?? "-")}</strong></div>
-              <div><span>Clave catastral</span><strong>{String(cajaPredialPredio.PredioCveCatastral ?? "-")}</strong></div>
-              <div><span>Nombre propietario</span><strong>{String(cajaPredialPredio.PropietarioNombre ?? "-")}</strong></div>
-              <div><span>RFC</span><strong>{String(cajaPredialPredio.PropietarioRFC ?? "-")}</strong></div>
-              <div>
-                <span>Dirección</span>
-                <strong>
-                  {[
-                    cajaPredialPredio.PredioCalle,
-                    cajaPredialPredio.PredioNumExt,
-                    cajaPredialPredio.PredioNumInt,
-                    cajaPredialPredio.PredioCodigoPostal ? `CP ${cajaPredialPredio.PredioCodigoPostal}` : ""
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                </strong>
-              </div>
-              <div>
-                <span>Valor catastral</span>
-                <strong>
-                  {moneyMx.format(
-                    Number(cajaPredialPredio.PredioValuoCatastralImporte ?? cajaPredialPredio.PredioCatastralImporte ?? 0) || 0
-                  )}
-                </strong>
-              </div>
-            </div>
-          ) : (
-            <div className="empty">Busca un predio para mostrar sus datos.</div>
-          )}
+          {cajaPredialWarnings && cajaPredialWarnings.length ? (
+            <div className="empty">{cajaPredialWarnings.map((w, i) => (<div key={String(i)}>{String(w)}</div>))}</div>
+          ) : null}
         </section>
 
         <section className="panel">
           <div className="panel-header">
             <div>
               <h2>Vista previa</h2>
-              <p>Captura el periodo y parámetros. La actualización/recargos se calcula si envías INPC y tasas.</p>
+              <p>Captura el periodo final para calcular el pase de caja.</p>
             </div>
-            <div className="pill">
-              {cajaPredialPreview?.resumen?.total_a_pagar != null
-                ? `Total: ${moneyMx.format(Number(cajaPredialPreview.resumen.total_a_pagar) || 0)}`
-                : "Sin cálculo"}
+            <div className="panel-header-actions">
+              <div className="pill">
+                {cajaPredialPreview?.resumen?.total_a_pagar != null
+                  ? `Total: ${moneyMx.format(Number(cajaPredialPreview.resumen.total_a_pagar) || 0)}`
+                  : "Sin cálculo"}
+              </div>
+              <button className="primary" type="button" onClick={cajasVistaPreviaPredial} disabled={loading === "cajas_preview" || !cajaPredialPredio}>
+                {loading === "cajas_preview" ? "Calculando..." : "Calcular"}
+              </button>
             </div>
           </div>
 
-          <div className="grid">
-            <Field label="Tasa al millar">
-              <input name="tasaAlMillar" value={cajaPredialForm.tasaAlMillar} onChange={updateCajaPredialField} inputMode="decimal" placeholder="3.0" />
+          <div className="invoice-controls">
+            {(() => {
+              const next = _nextPeriodoFromUltimoPagado(cajaPredialForm.ejercicioInicial, cajaPredialForm.periodoInicial);
+              return (
+                <>
+                  <Field label="Ejercicio inicial (a cobrar)">
+                    <input value={next.ejercicio} readOnly />
+                  </Field>
+                  <Field label="Periodo inicial (a cobrar)">
+                    <input value={next.periodo} readOnly />
+                  </Field>
+                </>
+              );
+            })()}
+            <Field label="Ejercicio final">
+              <input name="ejercicioFinal" value={cajaPredialForm.ejercicioFinal} onChange={updateCajaPredialField} inputMode="numeric" placeholder="2026" />
             </Field>
-            <Field label="Día vencimiento">
-              <input name="diaVencimiento" value={cajaPredialForm.diaVencimiento} onChange={updateCajaPredialField} inputMode="numeric" placeholder="15" />
-            </Field>
-            <Field label="Fecha de pago" hint="Formato: YYYY-MM-DD">
-              <input name="fechaPago" value={cajaPredialForm.fechaPago} onChange={updateCajaPredialField} placeholder="2026-04-28" />
-            </Field>
-            <Field label="Periodo inicio (mes)">
-              <select name="periodoInicioMes" value={cajaPredialForm.periodoInicioMes} onChange={updateCajaPredialField}>
-                {[
-                  "Enero",
-                  "Febrero",
-                  "Marzo",
-                  "Abril",
-                  "Mayo",
-                  "Junio",
-                  "Julio",
-                  "Agosto",
-                  "Septiembre",
-                  "Octubre",
-                  "Noviembre",
-                  "Diciembre"
-                ].map((m, idx) => (
-                  <option key={m} value={String(idx + 1)}>
-                    {m}
-                  </option>
-                ))}
+            <Field label="Periodo final">
+              <select name="periodoFinal" value={cajaPredialForm.periodoFinal} onChange={updateCajaPredialField}>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+                <option value="6">6</option>
               </select>
             </Field>
-            <Field label="Periodo inicio (año)">
-              <input name="periodoInicioAnio" value={cajaPredialForm.periodoInicioAnio} onChange={updateCajaPredialField} inputMode="numeric" placeholder="2026" />
-            </Field>
-            <Field label="Periodo fin (mes)">
-              <select name="periodoFinMes" value={cajaPredialForm.periodoFinMes} onChange={updateCajaPredialField}>
-                {[
-                  "Enero",
-                  "Febrero",
-                  "Marzo",
-                  "Abril",
-                  "Mayo",
-                  "Junio",
-                  "Julio",
-                  "Agosto",
-                  "Septiembre",
-                  "Octubre",
-                  "Noviembre",
-                  "Diciembre"
-                ].map((m, idx) => (
-                  <option key={m} value={String(idx + 1)}>
-                    {m}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="Periodo fin (año)">
-              <input name="periodoFinAnio" value={cajaPredialForm.periodoFinAnio} onChange={updateCajaPredialField} inputMode="numeric" placeholder="2026" />
-            </Field>
-          </div>
-
-          <div className="grid">
-            <Field label="Tasas recargos (JSON)" hint='Ej: {"2026": 0.015}'>
-              <textarea name="tasasRecargosJson" value={cajaPredialForm.tasasRecargosJson} onChange={updateCajaPredialField} rows={6} />
-            </Field>
-            <Field label="Tabla INPC (JSON)" hint='Ej: {"2026-03": 135.2, "2026-02": 134.8}'>
-              <textarea name="tablaINPCJson" value={cajaPredialForm.tablaINPCJson} onChange={updateCajaPredialField} rows={6} />
-            </Field>
-          </div>
-
-          <div className="actions">
-            <button className="primary" type="button" onClick={cajasVistaPreviaPredial} disabled={loading === "cajas_preview"}>
-              {loading === "cajas_preview" ? "Calculando..." : "Calcular vista previa"}
-            </button>
           </div>
 
           {cajaPredialError ? <div className="empty">{cajaPredialError}</div> : null}
+          {cajaPredialWarnings && cajaPredialWarnings.length ? (
+            <div className="empty">{cajaPredialWarnings.map((w, i) => (<div key={String(i)}>{String(w)}</div>))}</div>
+          ) : null}
         </section>
 
         {cajaPredialPreview ? (
           <>
+            <section className="panel invoice-panel">
+              {(() => {
+                const corrienteYear = new Date().getFullYear();
+                const mensual = cajaPredialPreview?.desglose_mensual || [];
+
+                const bims = new Map();
+                for (const r of mensual) {
+                  const anio = Number(r?.anio);
+                  const mes = Number(r?.mes);
+                  if (!Number.isFinite(anio) || !Number.isFinite(mes)) continue;
+                  const bim = Math.max(1, Math.min(6, Math.ceil(mes / 2)));
+                  const key = `${anio}-${bim}`;
+                  if (!bims.has(key)) {
+                    bims.set(key, { anio, bimestre: bim, original: 0, actualizacion: 0, recargos: 0 });
+                  }
+                  const item = bims.get(key);
+                  item.original += Number(r?.cuota_original) || 0;
+                  item.actualizacion += Number(r?.importe_actualizacion) || 0;
+                  item.recargos += Number(r?.importe_recargos) || 0;
+                }
+
+                function segmentOfYear(year) {
+                  if (year < corrienteYear) return "rezago";
+                  if (year === corrienteYear) return "corriente";
+                  return "subsecuente";
+                }
+
+                const segments = {
+                  rezago: { impuestoCount: 0, impuestoSum: 0, actCount: 0, actSum: 0, recCount: 0, recSum: 0 },
+                  corriente: { impuestoCount: 0, impuestoSum: 0, actCount: 0, actSum: 0, recCount: 0, recSum: 0 },
+                  subsecuente: { impuestoCount: 0, impuestoSum: 0, actCount: 0, actSum: 0, recCount: 0, recSum: 0 }
+                };
+
+                for (const item of bims.values()) {
+                  const seg = segmentOfYear(Number(item.anio));
+                  segments[seg].impuestoCount += 1;
+                  segments[seg].impuestoSum += Number(item.original) || 0;
+                  if ((Number(item.actualizacion) || 0) > 0) segments[seg].actCount += 1;
+                  segments[seg].actSum += Number(item.actualizacion) || 0;
+                  if ((Number(item.recargos) || 0) > 0) segments[seg].recCount += 1;
+                  segments[seg].recSum += Number(item.recargos) || 0;
+                }
+
+                const rows = [];
+                let itemIndex = 0;
+                function pushGroup(title) {
+                  rows.push({ type: "group", title });
+                }
+                function pushItem(label, qty, amount) {
+                  itemIndex += 1;
+                  rows.push({ type: "item", n: itemIndex, label, qty, avaluo: 0, amount });
+                }
+
+                if (segments.rezago.impuestoCount > 0) {
+                  pushGroup("Rezago");
+                  pushItem("Impuesto predial", segments.rezago.impuestoCount, segments.rezago.impuestoSum);
+                  pushItem("Actualizaciones", segments.rezago.actCount, segments.rezago.actSum);
+                  pushItem("Recargos", segments.rezago.recCount, segments.rezago.recSum);
+                }
+                if (segments.corriente.impuestoCount > 0) {
+                  pushGroup("Corriente");
+                  pushItem("Impuesto predial", segments.corriente.impuestoCount, segments.corriente.impuestoSum);
+                  pushItem("Actualizaciones", segments.corriente.actCount, segments.corriente.actSum);
+                  pushItem("Recargos", segments.corriente.recCount, segments.corriente.recSum);
+                }
+                if (segments.subsecuente.impuestoCount > 0) {
+                  pushGroup("Subsecuente");
+                  pushItem("Impuesto predial", segments.subsecuente.impuestoCount, segments.subsecuente.impuestoSum);
+                }
+
+                const periodoInicioCobro = cajaPredialPreview?.parametros?.periodo_inicio;
+                const periodoFinCobro = cajaPredialPreview?.parametros?.periodo_fin;
+                const periodoInicioCapturado = cajaPredialPreview?.parametros?.periodo_inicio_capturado;
+                const periodoCobroLabel = (() => {
+                  const pi = periodoInicioCobro;
+                  const pf = periodoFinCobro;
+                  if (pi && pf && Number.isFinite(Number(pi.anio)) && Number.isFinite(Number(pi.mes)) && Number.isFinite(Number(pf.anio)) && Number.isFinite(Number(pf.mes))) {
+                    const piPer = Math.max(1, Math.min(6, Math.ceil(Number(pi.mes) / 2)));
+                    const pfPer = Math.max(1, Math.min(6, Math.ceil(Number(pf.mes) / 2)));
+                    return `${Number(pi.anio)}-${piPer} → ${Number(pf.anio)}-${pfPer}`;
+                  }
+                  return `${String(cajaPredialForm.ejercicioInicial)}-${String(cajaPredialForm.periodoInicial)} → ${String(cajaPredialForm.ejercicioFinal)}-${String(cajaPredialForm.periodoFinal)}`;
+                })();
+                const periodoUltimoPagoLabel = (() => {
+                  const pi = periodoInicioCapturado;
+                  if (pi && Number.isFinite(Number(pi.anio)) && Number.isFinite(Number(pi.mes))) {
+                    const per = Math.max(1, Math.min(6, Math.ceil(Number(pi.mes) / 2)));
+                    return `${Number(pi.anio)}-${per}`;
+                  }
+                  return `${String(cajaPredialForm.ejercicioInicial)}-${String(cajaPredialForm.periodoInicial)}`;
+                })();
+                const fechaBaseEmision = cajaPredialForm.fechaPago ? new Date(String(cajaPredialForm.fechaPago)) : new Date();
+                const fechaEmision = _formatYmdLocal(fechaBaseEmision);
+                const fechaVencimientoPase = _nextCorteVencimientoPaseYmd(fechaBaseEmision, 17);
+                const cajeraNombre = String(user?.displayName || user?.username || "Cajero/a");
+
+                return (
+                  <>
+              <div id="predial-invoice">
+                <div className="invoice-header">
+                  <div className="invoice-brand">
+                    <div className="invoice-brand-mark">
+                      <div className="invoice-avatar">CJ</div>
+                      <div>
+                        <div className="invoice-title">Pase de caja</div>
+                        <div className="invoice-subtitle">Predial · {cajeraNombre}</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="invoice-meta">
+                    <div className="invoice-meta-row">
+                      <span className="invoice-meta-label">Ejercicio/Periodo (a cobrar)</span>
+                      <span className="invoice-meta-value">{periodoCobroLabel}</span>
+                    </div>
+                    <div className="invoice-meta-row">
+                      <span className="invoice-meta-label">Fecha de emisión</span>
+                      <span className="invoice-meta-value">{fechaEmision}</span>
+                    </div>
+                    <div className="invoice-meta-row">
+                      <span className="invoice-meta-label">Fecha de vencimiento</span>
+                      <span className="invoice-meta-value">{fechaVencimientoPase}</span>
+                    </div>
+                    <div className="invoice-meta-row">
+                      <span className="invoice-meta-label">Predio</span>
+                      <span className="invoice-meta-value">
+                        {String(cajaPredialPreview?.predio?.PredioId ?? cajaPredialForm.predioId ?? "")} ·{" "}
+                        {String(cajaPredialPreview?.predio?.PredioCveCatastral ?? cajaPredialForm.claveCatastral ?? "")}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+              <div className="invoice-parties">
+                <div className="invoice-party">
+                  <div className="invoice-party-title">Contribuyente</div>
+                  <div className="invoice-party-line">{String(cajaPredialPreview?.predio?.PropietarioNombre ?? "")}</div>
+                  <div className="invoice-party-line">{String(cajaPredialPreview?.predio?.PropietarioRFC ?? "")}</div>
+                </div>
+                <div className="invoice-party">
+                  <div className="invoice-party-title">Predio</div>
+                  <div className="invoice-party-line">
+                    {[
+                      cajaPredialPreview?.predio?.PredioCalle,
+                      cajaPredialPreview?.predio?.PredioNumExt,
+                      cajaPredialPreview?.predio?.PredioNumInt,
+                      cajaPredialPreview?.predio?.PredioCodigoPostal ? `CP ${cajaPredialPreview?.predio?.PredioCodigoPostal}` : ""
+                    ]
+                      .filter(Boolean)
+                      .join(" ")}
+                  </div>
+                </div>
+              </div>
+
+              <div className="invoice-table-shell">
+                <table className="invoice-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Item</th>
+                      <th className="num">Cantidad</th>
+                      <th className="num">Avalúo</th>
+                      <th className="num">Importe</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r, idx) =>
+                      r.type === "group" ? (
+                        <tr key={`g-${idx}`} className="invoice-group-row">
+                          <td colSpan={5}>{r.title}</td>
+                        </tr>
+                      ) : (
+                        <tr key={`i-${idx}`}>
+                          <td>{String(r.n)}</td>
+                          <td>{r.label}</td>
+                          <td className="num">{String(r.qty)}</td>
+                          <td className="num">{moneyMx.format(Number(r.avaluo) || 0)}</td>
+                          <td className="num">{moneyMx.format(Number(r.amount) || 0)}</td>
+                        </tr>
+                      )
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="invoice-bottom">
+                <div className="invoice-notes">
+                  <div className="invoice-notes-title">Información importante</div>
+                  <div className="invoice-notes-grid">
+                    <div className="invoice-notes-item">
+                      <div className="invoice-notes-label">Último periodo pagado</div>
+                      <div className="invoice-notes-value">{periodoUltimoPagoLabel}</div>
+                    </div>
+                    <div className="invoice-notes-item">
+                      <div className="invoice-notes-label">Fecha del último pago</div>
+                      <input className="invoice-notes-input" name="fechaUltimoPago" value={cajaPredialPaseNotas.fechaUltimoPago} onChange={updateCajaPredialPaseNota} placeholder="YYYY-MM-DD" />
+                    </div>
+                    <div className="invoice-notes-item">
+                      <div className="invoice-notes-label">Número de recibo / folio</div>
+                      <input className="invoice-notes-input" name="folioRecibo" value={cajaPredialPaseNotas.folioRecibo} onChange={updateCajaPredialPaseNota} placeholder="Ej. 00012345" />
+                    </div>
+                    <div className="invoice-notes-item">
+                      <div className="invoice-notes-label">Importe pagado</div>
+                      <input className="invoice-notes-input" name="importePagado" value={cajaPredialPaseNotas.importePagado} onChange={updateCajaPredialPaseNota} placeholder="$0.00" />
+                    </div>
+                    <div className="invoice-notes-item invoice-notes-span-2">
+                      <div className="invoice-notes-label">Notas</div>
+                      <textarea className="invoice-notes-textarea" name="notas" value={cajaPredialPaseNotas.notas} onChange={updateCajaPredialPaseNota} rows={4} placeholder="Observaciones, referencias, acuerdos..." />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="invoice-right">
+                  <div className="invoice-totals">
+                    <div className="invoice-totals-row">
+                      <span>Cuotas originales</span>
+                      <strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_cuotas_originales) || 0)}</strong>
+                    </div>
+                    <div className="invoice-totals-row">
+                      <span>Actualización</span>
+                      <strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_actualizacion) || 0)}</strong>
+                    </div>
+                    <div className="invoice-totals-row">
+                      <span>Recargos</span>
+                      <strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_recargos) || 0)}</strong>
+                    </div>
+                    <div className="invoice-totals-row total">
+                      <span>Total a pagar</span>
+                      <strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_a_pagar) || 0)}</strong>
+                    </div>
+                  </div>
+                  <div className="invoice-actions">
+                    <button type="button" onClick={() => abrirVisualizacionPase({ imprimir: false })}>Visualizar</button>
+                    <button type="button" className="primary" onClick={() => abrirVisualizacionPase({ imprimir: true })}>Imprimir</button>
+                  </div>
+                </div>
+              </div>
+              </div>
+                  </>
+                );
+              })()}
+            </section>
+
             <section className="panel">
               <div className="panel-header">
                 <div>
@@ -3013,13 +3696,31 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                 </div>
                 <div className="pill">{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_a_pagar) || 0)}</div>
               </div>
-              <div className="connection-list">
-                <div><span>Monto anual</span><strong>{moneyMx.format(Number(cajaPredialPreview?.parametros?.monto_anual) || 0)}</strong></div>
-                <div><span>Cuota mensual</span><strong>{moneyMx.format(Number(cajaPredialPreview?.parametros?.cuota_mensual) || 0)}</strong></div>
-                <div><span>Cuotas originales</span><strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_cuotas_originales) || 0)}</strong></div>
-                <div><span>Actualización</span><strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_actualizacion) || 0)}</strong></div>
-                <div><span>Recargos</span><strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_recargos) || 0)}</strong></div>
-                <div><span>Total a pagar</span><strong>{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_a_pagar) || 0)}</strong></div>
+              <div className="totals-bar">
+                <div className="totals-item">
+                  <div className="totals-label">Monto anual</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.parametros?.monto_anual) || 0)}</div>
+                </div>
+                <div className="totals-item">
+                  <div className="totals-label">Cuota mensual</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.parametros?.cuota_mensual) || 0)}</div>
+                </div>
+                <div className="totals-item">
+                  <div className="totals-label">Cuotas originales</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_cuotas_originales) || 0)}</div>
+                </div>
+                <div className="totals-item">
+                  <div className="totals-label">Actualización</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_actualizacion) || 0)}</div>
+                </div>
+                <div className="totals-item">
+                  <div className="totals-label">Recargos</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_recargos) || 0)}</div>
+                </div>
+                <div className="totals-item totals-item-total">
+                  <div className="totals-label">Total a pagar</div>
+                  <div className="totals-value">{moneyMx.format(Number(cajaPredialPreview?.resumen?.total_a_pagar) || 0)}</div>
+                </div>
               </div>
             </section>
 
@@ -5008,6 +5709,27 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
               </button>
               <button
                 type="button"
+                className={`tab ${configSection === "recargos" ? "active" : ""}`}
+                onClick={() => {
+                  setConfigSection("recargos");
+                  loadRecargos();
+                }}
+              >
+                Recargos
+              </button>
+              <button
+                type="button"
+                className={`tab ${configSection === "inpc" ? "active" : ""}`}
+                onClick={() => {
+                  setConfigSection("inpc");
+                  loadInpcFiles();
+                  loadInpcHistoricoCurrentYear();
+                }}
+              >
+                INPC
+              </button>
+              <button
+                type="button"
                 className={`tab ${configSection === "cri" ? "active" : ""}`}
                 onClick={() => {
                   setConfigSection("cri");
@@ -5096,6 +5818,265 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                     <div className="empty">Aún no hay UMAs configuradas.</div>
                   )}
                 </div>
+              </>
+            ) : null}
+
+            {configSection === "recargos" ? (
+              <>
+                <div className="panel-header">
+                  <div>
+                    <h2>Recargos</h2>
+                    <p>Tasa mensual de recargos por mora (CFF/LIF). Se usa en cálculos como el pase de caja predial.</p>
+                  </div>
+                  <div className="pill">{recargosRows.length} registros</div>
+                </div>
+
+                {recargosError ? <div className="alert error">{recargosError}</div> : null}
+
+                <div className="grid">
+                  <Field label="Ejercicio (año)">
+                    <input name="year" value={recargosForm.year} onChange={updateRecargosField} inputMode="numeric" placeholder={String(new Date().getFullYear())} />
+                  </Field>
+                  <Field label="Tasa mora (mensual)">
+                    <input name="tasaMora" value={recargosForm.tasaMora} onChange={updateRecargosField} inputMode="decimal" placeholder="0.0147" />
+                  </Field>
+                </div>
+
+                <div className="actions">
+                  <button className="primary" type="button" onClick={saveRecargo} disabled={loading === "recargos-save"}>
+                    {loading === "recargos-save" ? "Guardando..." : "Guardar"}
+                  </button>
+                  <button className="ghost" type="button" onClick={loadRecargos} disabled={loading === "recargos"}>
+                    {loading === "recargos" ? "Cargando..." : "Recargar"}
+                  </button>
+                </div>
+
+                <div className="table-space">
+                  {recargosRows && recargosRows.length ? (
+                    <div className="table-shell">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Ejercicio</th>
+                            <th>Tasa mora (mensual)</th>
+                            <th>Acciones</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {recargosRows.map((r) => (
+                            <tr key={String(r.year)}>
+                              <td>{String(r.year)}</td>
+                              <td>{Number(r.tasaMora || 0).toFixed(4)}</td>
+                              <td>
+                                <button className="ghost" type="button" onClick={() => editRecargoRow(r)}>
+                                  Editar
+                                </button>{" "}
+                                <button
+                                  className="danger"
+                                  type="button"
+                                  onClick={() => deleteRecargoRow(r.year)}
+                                  disabled={loading === "recargos-delete"}
+                                >
+                                  Eliminar
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="empty">{loading === "recargos" ? "Cargando..." : "Aún no hay recargos configurados."}</div>
+                  )}
+                </div>
+              </>
+            ) : null}
+
+            {configSection === "inpc" ? (
+              <>
+                <div className="panel-header">
+                  <div>
+                    <h2>INPC</h2>
+                    <p>Archivos JSON del Índice Nacional de Precios al Consumidor. Se usan para actualizaciones en cálculos (p. ej. pase de caja predial).</p>
+                  </div>
+                  <div className="pill">{inpcFiles.length} archivos</div>
+                </div>
+
+                {inpcEditorError ? <div className="alert error">{inpcEditorError}</div> : null}
+
+                <section className="panel">
+                  <div className="panel-header">
+                    <div>
+                      <h2>INPC · Año corriente</h2>
+                      <p>Captura y mantenimiento del año corriente en inpc_historico.json.</p>
+                    </div>
+                    <div className="pill">
+                      {new Date().getFullYear()} · {inpcHistoricoYearRows.length} meses
+                    </div>
+                  </div>
+
+                  <div className="grid">
+                    <Field label="Mes">
+                      <select name="month" value={inpcHistoricoForm.month} onChange={updateInpcHistoricoField}>
+                        {monthNamesEs.map((label, i) => (
+                          <option key={String(i + 1)} value={String(i + 1)}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="INPC">
+                      <input
+                        name="value"
+                        value={inpcHistoricoForm.value}
+                        onChange={updateInpcHistoricoField}
+                        inputMode="decimal"
+                        placeholder="145.544"
+                      />
+                    </Field>
+                  </div>
+
+                  <div className="actions">
+                    <button className="primary" type="button" onClick={saveInpcHistoricoMonth} disabled={loading === "inpc-historico-save"}>
+                      {loading === "inpc-historico-save" ? "Guardando..." : "Guardar INPC"}
+                    </button>
+                    <button className="ghost" type="button" onClick={loadInpcHistoricoCurrentYear} disabled={loading === "inpc-historico"}>
+                      {loading === "inpc-historico" ? "Cargando..." : "Recargar"}
+                    </button>
+                  </div>
+
+                  <div className="table-space">
+                    {inpcHistoricoYearRows && inpcHistoricoYearRows.length ? (
+                      <div className="table-shell">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Mes</th>
+                              <th>INPC</th>
+                              <th>Acciones</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {inpcHistoricoYearRows.map((r) => (
+                              <tr key={String(r.key)}>
+                                <td>
+                                  {String(r.monthLabel)} {String(r.year)}
+                                </td>
+                                <td>{Number(r.value || 0).toFixed(3)}</td>
+                                <td>
+                                  <button className="ghost" type="button" onClick={() => editInpcHistoricoRow(r)}>
+                                    Editar
+                                  </button>{" "}
+                                  <button
+                                    className="danger"
+                                    type="button"
+                                    onClick={() => deleteInpcHistoricoMonth(r.month)}
+                                    disabled={loading === "inpc-historico-delete"}
+                                  >
+                                    Eliminar
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="empty">
+                        {loading === "inpc-historico" ? "Cargando..." : "Aún no hay meses del año corriente en inpc_historico.json."}
+                      </div>
+                    )}
+                  </div>
+                </section>
+
+                <div className="grid">
+                  <Field label="Cargar archivo INPC (.json)">
+                    <input type="file" accept="application/json,.json" onChange={uploadInpcFile} disabled={loading === "inpc-upload"} />
+                  </Field>
+                </div>
+
+                <div className="actions">
+                  <button className="ghost" type="button" onClick={loadInpcFiles} disabled={loading === "inpc"}>
+                    {loading === "inpc" ? "Cargando..." : "Recargar"}
+                  </button>
+                </div>
+
+                <div className="table-space">
+                  {inpcFiles && inpcFiles.length ? (
+                    <div className="table-shell">
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Archivo</th>
+                            <th>Meses</th>
+                            <th>Rango</th>
+                            <th>Actualizado</th>
+                            <th>Acciones</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {inpcFiles.map((f) => (
+                            <tr key={String(f.name)}>
+                              <td>{String(f.name)}</td>
+                              <td>{String(f.monthCount ?? 0)}</td>
+                              <td>
+                                {f.minKey && f.maxKey ? `${String(f.minKey)} → ${String(f.maxKey)}` : "—"}
+                              </td>
+                              <td>{f.updatedAt ? String(f.updatedAt).replace("T", " ").slice(0, 19) : "—"}</td>
+                              <td>
+                                <button className="ghost" type="button" onClick={() => editInpcFile(f.name)} disabled={loading === "inpc-edit"}>
+                                  Editar
+                                </button>{" "}
+                                <button
+                                  className="danger"
+                                  type="button"
+                                  onClick={() => deleteInpcFile(f.name)}
+                                  disabled={loading === "inpc-delete"}
+                                >
+                                  Eliminar
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="empty">Aún no hay archivos INPC cargados.</div>
+                  )}
+                </div>
+
+                {inpcEditorName ? (
+                  <section className="panel">
+                    <div className="panel-header">
+                      <div>
+                        <h2>Editar archivo</h2>
+                        <p>{String(inpcEditorName)}</p>
+                      </div>
+                    </div>
+                    <div className="grid">
+                      <Field label="Contenido (JSON)">
+                        <textarea value={inpcEditorText} onChange={(e) => setInpcEditorText(e.target.value)} rows={12} />
+                      </Field>
+                    </div>
+                    <div className="actions">
+                      <button className="primary" type="button" onClick={saveInpcFile} disabled={loading === "inpc-save"}>
+                        {loading === "inpc-save" ? "Guardando..." : "Guardar"}
+                      </button>
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() => {
+                          setInpcEditorName("");
+                          setInpcEditorText("");
+                          setInpcEditorError("");
+                        }}
+                      >
+                        Cancelar
+                      </button>
+                    </div>
+                  </section>
+                ) : null}
               </>
             ) : null}
 
