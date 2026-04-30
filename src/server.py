@@ -4,6 +4,8 @@ import decimal
 import threading
 import secrets
 import hashlib
+import uuid
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
@@ -13,6 +15,7 @@ import pyodbc
 import orjson
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, ORJSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openpyxl import Workbook
@@ -26,6 +29,17 @@ dotenv_path = os.getenv("DOTENV_PATH")
 load_dotenv(dotenv_path=dotenv_path or (BASE_DIR / ".env"), override=False)
  
 app = FastAPI()
+
+_cors_origins_raw = os.getenv("CORS_ORIGINS") or ""
+_cors_origins = [s.strip() for s in _cors_origins_raw.split(",") if s.strip()]
+if _cors_origins:
+  app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+  )
  
 UMA_MXN_BY_VIGENCIA_YEAR: Dict[int, decimal.Decimal] = {}
 _UMA_STORE_LOCK = threading.Lock()
@@ -45,6 +59,31 @@ _LOGIN_RATE_LOCK = threading.Lock()
 _LOGIN_RATE_BUCKETS: Dict[str, List[float]] = {}
 _LOGIN_RATE_WINDOW_SECONDS = int(os.getenv("LOGIN_RATE_WINDOW_SECONDS") or "300")
 _LOGIN_RATE_MAX = int(os.getenv("LOGIN_RATE_MAX") or "20")
+
+_API_RATE_LOCK = threading.Lock()
+_API_RATE_BUCKETS: Dict[str, List[float]] = {}
+_API_RATE_WINDOW_SECONDS = int(os.getenv("API_RATE_WINDOW_SECONDS") or "60")
+_API_RATE_MAX = int(os.getenv("API_RATE_MAX") or "600")
+
+_REPORT_RATE_LOCK = threading.Lock()
+_REPORT_RATE_BUCKETS: Dict[str, List[float]] = {}
+_REPORT_RATE_WINDOW_SECONDS = int(os.getenv("REPORT_RATE_WINDOW_SECONDS") or "60")
+_REPORT_RATE_MAX = int(os.getenv("REPORT_RATE_MAX") or "60")
+
+_REPORT_ASYNC_THRESHOLD_ROWS = int(os.getenv("REPORT_ASYNC_THRESHOLD_ROWS") or "10000")
+_REPORT_JOBS_TTL_SECONDS = int(os.getenv("REPORT_JOBS_TTL_SECONDS") or str(24 * 60 * 60))
+_REPORT_JOBS_DIR = Path(os.getenv("REPORT_JOBS_DIR") or (BASE_DIR / "tmp_report_jobs"))
+
+_DEADLOCK_RETRIES = int(os.getenv("DEADLOCK_RETRIES") or "3")
+
+
+def _boolish(value: Any, default: bool = False) -> bool:
+  if value in (None, "", "null"):
+    return bool(default)
+  return str(value).strip().lower() in {"1", "true", "yes", "y", "si", "sí"}
+
+
+_AUDIT_ENABLED = _boolish(os.getenv("AUDIT_ENABLED"), True)
 
 
 def _client_ip(request: Request) -> str:
@@ -100,6 +139,41 @@ def _check_login_rate_limit(request: Request) -> None:
       raise HTTPException(status_code=429, detail="Demasiados intentos, espera unos minutos")
     bucket.append(now)
 
+
+def _check_ip_rate_limit(
+  request: Request,
+  buckets: Dict[str, List[float]],
+  lock: threading.Lock,
+  window_seconds: int,
+  max_requests: int,
+  scope: str,
+) -> None:
+  ip = _client_ip(request)
+  now = datetime.utcnow().timestamp()
+  key = f"{scope}:{ip}"
+  with lock:
+    bucket = buckets.get(key)
+    if not bucket:
+      bucket = []
+      buckets[key] = bucket
+    cutoff = now - float(window_seconds)
+    while bucket and bucket[0] < cutoff:
+      bucket.pop(0)
+    if len(bucket) >= int(max_requests):
+      raise HTTPException(status_code=429, detail="Demasiadas solicitudes, intenta más tarde")
+    bucket.append(now)
+
+
+def _is_deadlock_error(exc: Exception) -> bool:
+  try:
+    msg = str(exc).lower()
+    if "deadlock" in msg or "1205" in msg:
+      return True
+    if "40001" in msg:
+      return True
+  except Exception:
+    return False
+  return False
 
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
@@ -601,6 +675,57 @@ def _ensure_auth_schema_microservicios() -> None:
     """
   )
 
+  ddl.append(
+    """
+    IF OBJECT_ID('dbo.AppApiAudit', 'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.AppApiAudit (
+        AuditId     BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_AppApiAudit PRIMARY KEY,
+        CreatedAt   DATETIME2(0) NOT NULL CONSTRAINT DF_AppApiAudit_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        RequestId   NVARCHAR(60) NULL,
+        UserId      INT NULL,
+        Username    NVARCHAR(120) NULL,
+        Role        NVARCHAR(50) NULL,
+        Ip          NVARCHAR(45) NULL,
+        UserAgent   NVARCHAR(512) NULL,
+        Method      NVARCHAR(10) NOT NULL,
+        Path        NVARCHAR(200) NOT NULL,
+        StatusCode  INT NOT NULL,
+        DurationMs  INT NOT NULL
+      );
+      CREATE INDEX IX_AppApiAudit_CreatedAt ON dbo.AppApiAudit(CreatedAt);
+      CREATE INDEX IX_AppApiAudit_Path ON dbo.AppApiAudit(Path, CreatedAt);
+      CREATE INDEX IX_AppApiAudit_UserId ON dbo.AppApiAudit(UserId, CreatedAt);
+    END
+    """
+  )
+
+  ddl.append(
+    """
+    IF OBJECT_ID('dbo.AppReportJobs', 'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.AppReportJobs (
+        JobId            UNIQUEIDENTIFIER NOT NULL CONSTRAINT PK_AppReportJobs PRIMARY KEY,
+        Kind             NVARCHAR(80) NOT NULL,
+        ParamsJson       NVARCHAR(MAX) NOT NULL,
+        Status           NVARCHAR(20) NOT NULL,
+        CreatedByUserId  INT NULL,
+        CreatedByUsername NVARCHAR(120) NULL,
+        CreatedAt        DATETIME2(0) NOT NULL CONSTRAINT DF_AppReportJobs_CreatedAt DEFAULT (SYSUTCDATETIME()),
+        StartedAt        DATETIME2(0) NULL,
+        FinishedAt       DATETIME2(0) NULL,
+        ExpiresAt        DATETIME2(0) NOT NULL,
+        RowCount         INT NULL,
+        FileName         NVARCHAR(200) NULL,
+        ErrorMessage     NVARCHAR(400) NULL
+      );
+      CREATE INDEX IX_AppReportJobs_Status ON dbo.AppReportJobs(Status, CreatedAt);
+      CREATE INDEX IX_AppReportJobs_ExpiresAt ON dbo.AppReportJobs(ExpiresAt);
+      CREATE INDEX IX_AppReportJobs_CreatedBy ON dbo.AppReportJobs(CreatedByUserId, CreatedAt);
+    END
+    """
+  )
+
   conn = get_conn_for_database("MicroServicios")
   try:
     cur = conn.cursor()
@@ -628,6 +753,44 @@ def _audit_auth_event(event: str, username: Optional[str], user_id: Optional[int
         VALUES (?, ?, ?, ?, ?, ?);
         """,
         (str(event)[:50], (str(username)[:120] if username else None), user_id, ip, (str(ua)[:512] if ua else None), (str(detail)[:400] if detail else None)),
+      )
+      conn.commit()
+  except Exception:
+    return
+
+
+def _audit_api_event(request: Request, user: Optional[Dict[str, Any]], request_id: str, status_code: int, duration_ms: int) -> None:
+  if not _AUDIT_ENABLED:
+    return
+  try:
+    _ensure_auth_schema_microservicios()
+    ip = (request.client.host if request.client else None) or None
+    ua = request.headers.get("user-agent") or None
+    u = user or {}
+    user_id = int(u.get("id") or 0) if str(u.get("id") or "").strip() else None
+    username = (str(u.get("username") or "")[:120] or None) if u else None
+    role = (str(u.get("role") or "")[:50] or None) if u else None
+    method = str(request.method or "")[:10]
+    path = str(request.url.path or "")[:200]
+    with get_conn_for_database("MicroServicios") as conn:
+      cur = conn.cursor()
+      cur.execute(
+        """
+        INSERT INTO dbo.AppApiAudit (RequestId, UserId, Username, Role, Ip, UserAgent, Method, Path, StatusCode, DurationMs)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+          (str(request_id)[:60] if request_id else None),
+          user_id,
+          username,
+          role,
+          ip,
+          (str(ua)[:512] if ua else None),
+          method,
+          path,
+          int(status_code),
+          int(duration_ms),
+        ),
       )
       conn.commit()
   except Exception:
@@ -866,6 +1029,61 @@ async def _auth_guard_api(request: Request, call_next):
 
   return await call_next(request)
 
+
+@app.middleware("http")
+async def _rate_limit_and_audit(request: Request, call_next):
+  path = request.url.path or ""
+  request_id = (request.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex
+  started = datetime.utcnow()
+
+  if path.startswith("/api/"):
+    if path.startswith("/api/reportes/") or path.startswith("/api/analitica/"):
+      _check_ip_rate_limit(
+        request,
+        _REPORT_RATE_BUCKETS,
+        _REPORT_RATE_LOCK,
+        _REPORT_RATE_WINDOW_SECONDS,
+        _REPORT_RATE_MAX,
+        "report",
+      )
+    else:
+      _check_ip_rate_limit(
+        request,
+        _API_RATE_BUCKETS,
+        _API_RATE_LOCK,
+        _API_RATE_WINDOW_SECONDS,
+        _API_RATE_MAX,
+        "api",
+      )
+
+  user = None
+  try:
+    if path.startswith("/api/") and not path.startswith("/api/auth/"):
+      user = _get_current_user(request)
+  except Exception:
+    user = None
+
+  status_code = 500
+  try:
+    resp = await call_next(request)
+    status_code = int(getattr(resp, "status_code", 200) or 200)
+    try:
+      resp.headers.setdefault("X-Request-Id", request_id)
+    except Exception:
+      pass
+    return resp
+  except HTTPException as e:
+    status_code = int(getattr(e, "status_code", 500) or 500)
+    raise
+  except Exception:
+    status_code = 500
+    raise
+  finally:
+    try:
+      duration_ms = int((datetime.utcnow() - started).total_seconds() * 1000)
+      _audit_api_event(request, user, request_id, status_code, duration_ms)
+    except Exception:
+      pass
 
 @app.get("/api/auth/me")
 def auth_me(request: Request) -> ORJSONResponse:
@@ -2473,114 +2691,128 @@ async def consolidar(request: Request, x_admin_key: Optional[str] = Header(defau
 
     lk = _lock_key("consolidar", cve_fte_mt, grupo_tramite_id, solicitud_id, ano)
     _acquire_lock(lk, user, ttl_seconds=120)
- 
-    conn = get_conn()
-    try:
-      cur = conn.cursor()
-      cur.execute(
-        """
-        DECLARE @GrupoTramiteId int = ?;
-        DECLARE @SolicitudId int = ?;
-        DECLARE @Ano int = ?;
-        DECLARE @CveFteMT varchar(32) = ?;
-        DECLARE @NuevoEstado varchar(8) = ?;
-        DECLARE @Vencimiento varchar(32) = ?;
- 
-        SET NOCOUNT ON;
-        SET XACT_ABORT ON;
- 
-        DECLARE @FtePrincipal int;
-        DECLARE @FteSecundario int;
-        DECLARE @ImporteTotal decimal(18,2);
-        DECLARE @Cnt int;
- 
-        ;WITH x AS (
+
+    resumen = None
+    rows = []
+    attempts = max(1, int(_DEADLOCK_RETRIES))
+    for attempt in range(attempts):
+      conn = get_conn()
+      try:
+        cur = conn.cursor()
+        cur.execute(
+          """
+          DECLARE @GrupoTramiteId int = ?;
+          DECLARE @SolicitudId int = ?;
+          DECLARE @Ano int = ?;
+          DECLARE @CveFteMT varchar(32) = ?;
+          DECLARE @NuevoEstado varchar(8) = ?;
+          DECLARE @Vencimiento varchar(32) = ?;
+   
+          SET NOCOUNT ON;
+          SET XACT_ABORT ON;
+   
+          DECLARE @FtePrincipal int;
+          DECLARE @FteSecundario int;
+          DECLARE @ImporteTotal decimal(18,2);
+          DECLARE @Cnt int;
+   
+          ;WITH x AS (
+            SELECT
+              SolicitudDetalleFteIngId,
+              CAST(SolicitudDetalleImporteFijo AS decimal(18,2)) AS Importe,
+              ROW_NUMBER() OVER (ORDER BY SolicitudDetalleFteIngId ASC) AS rn_asc,
+              ROW_NUMBER() OVER (ORDER BY SolicitudDetalleFteIngId DESC) AS rn_desc,
+              COUNT(*) OVER () AS cnt
+            FROM TLSOLICITUDFUENTESINGRESO WITH (UPDLOCK, HOLDLOCK)
+            WHERE GrupoTramiteId = @GrupoTramiteId
+              AND SolicitudId = @SolicitudId
+              AND SolicitudDetalleEjericicio = @Ano
+              AND CveFteMT = @CveFteMT
+          )
           SELECT
+            @FtePrincipal = MAX(CASE WHEN rn_asc = 1 THEN SolicitudDetalleFteIngId END),
+            @FteSecundario = MAX(CASE WHEN rn_desc = 1 THEN SolicitudDetalleFteIngId END),
+            @ImporteTotal = SUM(Importe),
+            @Cnt = MAX(cnt)
+          FROM x;
+   
+          IF @Cnt <> 2 OR @FtePrincipal IS NULL OR @FteSecundario IS NULL OR @FtePrincipal = @FteSecundario
+            THROW 51000, 'Se requieren exactamente 2 registros para consolidar (mismo filtro).', 1;
+   
+          UPDATE TLSOLICITUDFUENTESINGRESO
+          SET SolicitudDetalleImporteFijo = @ImporteTotal
+          WHERE GrupoTramiteId = @GrupoTramiteId
+            AND SolicitudId = @SolicitudId
+            AND SolicitudDetalleEjericicio = @Ano
+            AND SolicitudDetalleFteIngId = @FtePrincipal
+            AND CveFteMT = @CveFteMT;
+   
+          DELETE FROM TLSOLICITUDFUENTESINGRESO
+          WHERE GrupoTramiteId = @GrupoTramiteId
+            AND SolicitudId = @SolicitudId
+            AND SolicitudDetalleEjericicio = @Ano
+            AND SolicitudDetalleFteIngId = @FteSecundario
+            AND CveFteMT = @CveFteMT;
+   
+          UPDATE TLSOLICITUD
+          SET
+            SolicitudEstado = @NuevoEstado,
+            SolicitudVencimientoFecha =
+              CASE
+                WHEN @Vencimiento IS NULL THEN SolicitudVencimientoFecha
+                ELSE COALESCE(
+                  TRY_CONVERT(datetime, @Vencimiento, 126),
+                  TRY_CONVERT(datetime, @Vencimiento, 23),
+                  TRY_CONVERT(datetime, @Vencimiento, 112),
+                  SolicitudVencimientoFecha
+                )
+              END
+          WHERE GrupoTramiteId = @GrupoTramiteId
+            AND SolicitudId = @SolicitudId;
+   
+          SELECT
+            @FtePrincipal AS FtePrincipal,
+            @FteSecundario AS FteSecundario,
+            @ImporteTotal AS ImporteTotal;
+   
+          SELECT
+            GrupoTramiteId,
+            SolicitudId,
+            SolicitudDetalleEjericicio,
             SolicitudDetalleFteIngId,
-            CAST(SolicitudDetalleImporteFijo AS decimal(18,2)) AS Importe,
-            ROW_NUMBER() OVER (ORDER BY SolicitudDetalleFteIngId ASC) AS rn_asc,
-            ROW_NUMBER() OVER (ORDER BY SolicitudDetalleFteIngId DESC) AS rn_desc,
-            COUNT(*) OVER () AS cnt
-          FROM TLSOLICITUDFUENTESINGRESO WITH (UPDLOCK, HOLDLOCK)
+            CveFteMT,
+            SolicitudDetalleImporteFijo
+          FROM TLSOLICITUDFUENTESINGRESO
           WHERE GrupoTramiteId = @GrupoTramiteId
             AND SolicitudId = @SolicitudId
             AND SolicitudDetalleEjericicio = @Ano
             AND CveFteMT = @CveFteMT
+          ORDER BY SolicitudDetalleFteIngId ASC
+          OPTION (RECOMPILE);
+          """,
+          (grupo_tramite_id, solicitud_id, ano, cve_fte_mt, nuevo_estado, vencimiento),
         )
-        SELECT
-          @FtePrincipal = MAX(CASE WHEN rn_asc = 1 THEN SolicitudDetalleFteIngId END),
-          @FteSecundario = MAX(CASE WHEN rn_desc = 1 THEN SolicitudDetalleFteIngId END),
-          @ImporteTotal = SUM(Importe),
-          @Cnt = MAX(cnt)
-        FROM x;
- 
-        IF @Cnt <> 2 OR @FtePrincipal IS NULL OR @FteSecundario IS NULL OR @FtePrincipal = @FteSecundario
-          THROW 51000, 'Se requieren exactamente 2 registros para consolidar (mismo filtro).', 1;
- 
-        UPDATE TLSOLICITUDFUENTESINGRESO
-        SET SolicitudDetalleImporteFijo = @ImporteTotal
-        WHERE GrupoTramiteId = @GrupoTramiteId
-          AND SolicitudId = @SolicitudId
-          AND SolicitudDetalleEjericicio = @Ano
-          AND SolicitudDetalleFteIngId = @FtePrincipal
-          AND CveFteMT = @CveFteMT;
- 
-        DELETE FROM TLSOLICITUDFUENTESINGRESO
-        WHERE GrupoTramiteId = @GrupoTramiteId
-          AND SolicitudId = @SolicitudId
-          AND SolicitudDetalleEjericicio = @Ano
-          AND SolicitudDetalleFteIngId = @FteSecundario
-          AND CveFteMT = @CveFteMT;
- 
-        UPDATE TLSOLICITUD
-        SET
-          SolicitudEstado = @NuevoEstado,
-          SolicitudVencimientoFecha =
-            CASE
-              WHEN @Vencimiento IS NULL THEN SolicitudVencimientoFecha
-              ELSE COALESCE(
-                TRY_CONVERT(datetime, @Vencimiento, 126),
-                TRY_CONVERT(datetime, @Vencimiento, 23),
-                TRY_CONVERT(datetime, @Vencimiento, 112),
-                SolicitudVencimientoFecha
-              )
-            END
-        WHERE GrupoTramiteId = @GrupoTramiteId
-          AND SolicitudId = @SolicitudId;
- 
-        SELECT
-          @FtePrincipal AS FtePrincipal,
-          @FteSecundario AS FteSecundario,
-          @ImporteTotal AS ImporteTotal;
- 
-        SELECT
-          GrupoTramiteId,
-          SolicitudId,
-          SolicitudDetalleEjericicio,
-          SolicitudDetalleFteIngId,
-          CveFteMT,
-          SolicitudDetalleImporteFijo
-        FROM TLSOLICITUDFUENTESINGRESO
-        WHERE GrupoTramiteId = @GrupoTramiteId
-          AND SolicitudId = @SolicitudId
-          AND SolicitudDetalleEjericicio = @Ano
-          AND CveFteMT = @CveFteMT
-        ORDER BY SolicitudDetalleFteIngId ASC
-        OPTION (RECOMPILE);
-        """,
-        (grupo_tramite_id, solicitud_id, ano, cve_fte_mt, nuevo_estado, vencimiento),
-      )
- 
-      resumen_rows = _rows(cur)
-      resumen = resumen_rows[0] if resumen_rows else None
-      cur.nextset()
-      rows = _rows(cur)
-      conn.commit()
-    except Exception:
-      conn.rollback()
-      raise
-    finally:
-      conn.close()
+   
+        resumen_rows = _rows(cur)
+        resumen = resumen_rows[0] if resumen_rows else None
+        cur.nextset()
+        rows = _rows(cur)
+        conn.commit()
+        break
+      except Exception as e:
+        try:
+          conn.rollback()
+        except Exception:
+          pass
+        if attempt < (attempts - 1) and _is_deadlock_error(e):
+          time.sleep(0.15 * (2 ** attempt))
+          continue
+        raise
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
  
     resp = ORJSONResponse(
       {
@@ -2620,63 +2852,74 @@ async def activaciones(request: Request, x_admin_key: Optional[str] = Header(def
     lk = _lock_key("activaciones")
     _acquire_lock(lk, user, ttl_seconds=180)
 
-    conn = get_conn()
-    try:
-      cur = conn.cursor()
-      cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    attempts = max(1, int(_DEADLOCK_RETRIES))
+    for attempt in range(attempts):
+      conn = get_conn()
+      try:
+        cur = conn.cursor()
+        cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
 
-      cur.execute(
-        """
-        UPDATE KUMiObligacion
-        SET MiObligacionEstatus = N'AP'
-        WHERE (MiObligacionEstatus <> N'AP');
-        SELECT CAST(@@ROWCOUNT AS int) AS affected;
-        """
-      )
-      obligacion_row = cur.fetchone()
-      obligacion_rows = int(obligacion_row[0]) if obligacion_row else 0
+        cur.execute(
+          """
+          UPDATE KUMiObligacion
+          SET MiObligacionEstatus = N'AP'
+          WHERE (MiObligacionEstatus <> N'AP');
+          SELECT CAST(@@ROWCOUNT AS int) AS affected;
+          """
+        )
+        obligacion_row = cur.fetchone()
+        obligacion_rows = int(obligacion_row[0]) if obligacion_row else 0
 
-      cur.execute(
-        """
-        UPDATE KUMiDocumento
-        SET MiDocumentoEstatus = N'AP'
-        WHERE (MiDocumentoEstatus <> N'AP');
-        SELECT CAST(@@ROWCOUNT AS int) AS affected;
-        """
-      )
-      documento_row = cur.fetchone()
-      documento_rows = int(documento_row[0]) if documento_row else 0
+        cur.execute(
+          """
+          UPDATE KUMiDocumento
+          SET MiDocumentoEstatus = N'AP'
+          WHERE (MiDocumentoEstatus <> N'AP');
+          SELECT CAST(@@ROWCOUNT AS int) AS affected;
+          """
+        )
+        documento_row = cur.fetchone()
+        documento_rows = int(documento_row[0]) if documento_row else 0
 
-      cur.execute(
-        """
-        UPDATE COQFORMASPAGOPAQUETE
-        SET FormaPagoPaqueteCuentaBancaria = 235
-        WHERE (CveCaja = 29)
-          AND (CveFecAsi >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1));
-        SELECT CAST(@@ROWCOUNT AS int) AS affected;
-        """
-      )
-      paquete_row = cur.fetchone()
-      paquete_rows = int(paquete_row[0]) if paquete_row else 0
+        cur.execute(
+          """
+          UPDATE COQFORMASPAGOPAQUETE
+          SET FormaPagoPaqueteCuentaBancaria = 235
+          WHERE (CveCaja = 29)
+            AND (CveFecAsi >= DATEFROMPARTS(YEAR(GETDATE()), MONTH(GETDATE()), 1));
+          SELECT CAST(@@ROWCOUNT AS int) AS affected;
+          """
+        )
+        paquete_row = cur.fetchone()
+        paquete_rows = int(paquete_row[0]) if paquete_row else 0
 
-      conn.commit()
-      resp = ORJSONResponse(
-        {
-          "ok": True,
-          "updated_rows": {
-            "KUMiObligacion": obligacion_rows,
-            "KUMiDocumento": documento_rows,
-            "COQFORMASPAGOPAQUETE": paquete_rows,
-          },
-        }
-      )
-      _idempotency_store(request, user, body, resp)
-      return resp
-    except Exception:
-      conn.rollback()
-      raise
-    finally:
-      conn.close()
+        conn.commit()
+        resp = ORJSONResponse(
+          {
+            "ok": True,
+            "updated_rows": {
+              "KUMiObligacion": obligacion_rows,
+              "KUMiDocumento": documento_rows,
+              "COQFORMASPAGOPAQUETE": paquete_rows,
+            },
+          }
+        )
+        _idempotency_store(request, user, body, resp)
+        return resp
+      except Exception as e:
+        try:
+          conn.rollback()
+        except Exception:
+          pass
+        if attempt < (attempts - 1) and _is_deadlock_error(e):
+          time.sleep(0.15 * (2 ** attempt))
+          continue
+        raise
+      finally:
+        try:
+          conn.close()
+        except Exception:
+          pass
   except HTTPException:
     raise
   except Exception as e:
@@ -2699,6 +2942,539 @@ def _parse_date(value: Optional[str]) -> Optional[datetime]:
       return datetime.strptime(value, "%Y-%m-%d")
     except Exception:
       return None
+
+
+def _ensure_report_jobs_dir() -> None:
+  try:
+    _REPORT_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+  except Exception:
+    return
+
+
+def _report_job_file_path(job_id: str, ext: str) -> Path:
+  safe_ext = str(ext or "").strip().lower()
+  if safe_ext not in {"csv"}:
+    safe_ext = "csv"
+  _ensure_report_jobs_dir()
+  return _REPORT_JOBS_DIR / f"{job_id}.{safe_ext}"
+
+
+def _purge_expired_report_jobs() -> None:
+  try:
+    _ensure_auth_schema_microservicios()
+    with get_conn_for_database("MicroServicios") as conn:
+      cur = conn.cursor()
+      cur.execute(
+        """
+        SELECT TOP 50 JobId
+        FROM dbo.AppReportJobs
+        WHERE ExpiresAt < SYSUTCDATETIME()
+          AND Status NOT IN ('expired')
+        ORDER BY ExpiresAt ASC;
+        """
+      )
+      rows = cur.fetchall() or []
+      for r in rows:
+        try:
+          jid = str(r[0])
+        except Exception:
+          continue
+        try:
+          p = _report_job_file_path(jid, "csv")
+          if p.exists() and p.is_file():
+            try:
+              os.remove(p)
+            except Exception:
+              pass
+        except Exception:
+          pass
+        cur.execute("UPDATE dbo.AppReportJobs SET Status='expired' WHERE JobId = ?;", (jid,))
+      conn.commit()
+  except Exception:
+    return
+
+
+def _create_report_job(kind: str, params: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+  _purge_expired_report_jobs()
+  _ensure_auth_schema_microservicios()
+  job_id = str(uuid.uuid4())
+  try:
+    params_json = orjson.dumps(params or {}, option=orjson.OPT_SORT_KEYS).decode("utf-8")
+  except Exception:
+    params_json = "{}"
+  user_id = int(user.get("id") or 0) if str(user.get("id") or "").strip() else None
+  username = str(user.get("username") or "")[:120] or None
+  expires_at = datetime.utcnow() + timedelta(seconds=int(_REPORT_JOBS_TTL_SECONDS))
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      INSERT INTO dbo.AppReportJobs (JobId, Kind, ParamsJson, Status, CreatedByUserId, CreatedByUsername, ExpiresAt, FileName)
+      VALUES (?, ?, ?, 'queued', ?, ?, ?, ?);
+      """,
+      (job_id, str(kind)[:80], params_json, user_id, username, expires_at, f"{kind}.csv"),
+    )
+    conn.commit()
+  return {"jobId": job_id, "kind": kind, "status": "queued"}
+
+
+def _update_report_job(job_id: str, status: str, started: bool = False, finished: bool = False, row_count: Optional[int] = None, error: Optional[str] = None) -> None:
+  try:
+    _ensure_auth_schema_microservicios()
+    with get_conn_for_database("MicroServicios") as conn:
+      cur = conn.cursor()
+      started_at = datetime.utcnow() if started else None
+      finished_at = datetime.utcnow() if finished else None
+      cur.execute(
+        """
+        UPDATE dbo.AppReportJobs
+        SET
+          Status = ?,
+          StartedAt = COALESCE(StartedAt, ?),
+          FinishedAt = CASE WHEN ? IS NULL THEN FinishedAt ELSE ? END,
+          RowCount = COALESCE(?, RowCount),
+          ErrorMessage = COALESCE(?, ErrorMessage)
+        WHERE JobId = ?;
+        """,
+        (str(status)[:20], started_at, finished_at, finished_at, row_count, (str(error)[:400] if error else None), job_id),
+      )
+      conn.commit()
+  except Exception:
+    return
+
+
+def _get_report_job(job_id: str) -> Optional[Dict[str, Any]]:
+  _purge_expired_report_jobs()
+  _ensure_auth_schema_microservicios()
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT TOP 1
+        JobId AS jobId,
+        Kind AS kind,
+        ParamsJson AS paramsJson,
+        Status AS status,
+        CreatedAt AS createdAt,
+        StartedAt AS startedAt,
+        FinishedAt AS finishedAt,
+        ExpiresAt AS expiresAt,
+        RowCount AS rowCount,
+        FileName AS fileName,
+        ErrorMessage AS errorMessage
+      FROM dbo.AppReportJobs
+      WHERE JobId = ?;
+      """,
+      (job_id,),
+    )
+    rows = _rows(cur)
+    return rows[0] if rows else None
+
+
+def _write_csv_file(sql_text: str, sql_params: Tuple[Any, ...], columns: List[str], output_path: Path) -> int:
+  row_count = 0
+  conn = get_conn()
+  try:
+    cur = conn.cursor()
+    cur.execute(sql_text, sql_params)
+    while cur.description is None:
+      if not cur.nextset():
+        break
+    cols = [c[0] for c in cur.description] if cur.description else []
+    index = {name: i for i, name in enumerate(cols)}
+    with open(output_path, "wb") as f:
+      f.write(b"\xef\xbb\xbf")
+      f.write((",".join(columns) + "\n").encode("utf-8"))
+      while True:
+        batch = cur.fetchmany(500)
+        if not batch:
+          break
+        for row in batch:
+          line = ",".join(_csv_escape(row[index[c]]) if c in index else "" for c in columns) + "\n"
+          f.write(line.encode("utf-8"))
+          row_count += 1
+  finally:
+    try:
+      conn.close()
+    except Exception:
+      pass
+  return row_count
+
+
+def _run_report_job(job_id: str) -> None:
+  job = _get_report_job(job_id)
+  if not job:
+    return
+  if str(job.get("status") or "").lower() not in {"queued"}:
+    return
+
+  kind = str(job.get("kind") or "")
+  try:
+    params = orjson.loads(str(job.get("paramsJson") or "{}").encode("utf-8"))
+  except Exception:
+    params = {}
+
+  _update_report_job(job_id, "running", started=True)
+  out_path = _report_job_file_path(job_id, "csv")
+  try:
+    if kind == "prediales_sabana_csv":
+      p = _prediales_sabana_filters(params)
+      columns = p["columns"]
+      sql_params = p["sqlParams"]
+      row_count = _write_csv_file(_SABANA_PREDIALES_CSV, sql_params, columns, out_path)
+    elif kind == "prediales_sabana_pagos_csv":
+      cve_fte_mt = str(params.get("cveFteMT") or "MTULUM")
+      f = _prediales_pagos_filters(dict(params))
+      max_rows_raw = params.get("maxRows")
+      max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
+      max_rows = max(1, min(200000, max_rows))
+      columns = [
+        "Clave",
+        "Clave Catastral",
+        "Propietario",
+        "Razon social del contribuyente",
+        "Direccion",
+        "Colonia",
+        "Tipo de Predio",
+        "Valor del terreno",
+        "Área construida",
+        "Valor de construcción",
+        "Valor catastral",
+        "Calificativo",
+        "Estado fisico",
+        "Periodo inicial",
+        "Periodo final",
+        "Recibo",
+        "Fecha de Pago",
+        "Impuesto Corriente y Anticipado",
+        "Rezago años anteriores",
+        "Rezago",
+        "Adicional",
+        "Actualizacion",
+        "Recargos",
+        "Requerimiento",
+        "Embargo",
+        "Multa",
+        "Descuentos",
+        "Total",
+      ]
+      sql_params = (
+        cve_fte_mt,
+        f["claveCatastral"] or None,
+        f["claveCatastralFrom"] or None,
+        f["claveCatastralTo"] or None,
+        f["predioId"],
+        f["pagoFrom"],
+        f["pagoTo"],
+        max_rows,
+      )
+      row_count = _write_csv_file(_SABANA_PAGOS_CSV, sql_params, columns, out_path)
+    elif kind == "licencias_funcionamiento_csv":
+      cve_fte_mt = str(params.get("cveFteMT") or "MTULUM")
+      f = _licencias_func_filters(dict(params))
+      max_rows_raw = params.get("maxRows")
+      max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
+      max_rows = max(1, min(200000, max_rows))
+      def parse_int_env(name: str, default: Optional[int] = None) -> Optional[int]:
+        raw = os.getenv(name)
+        if raw in (None, "", "null"):
+          return default
+        try:
+          return int(str(raw).strip())
+        except Exception:
+          return default
+      licencia_principal = parse_int_env("LIC_FUNC_LICENCIA_FTEING")
+      actualizaciones_fteing = parse_int_env("LIC_FUNC_ACTUALIZACION_FTEING", 4319020273)
+      recargos_fteing = parse_int_env("LIC_FUNC_RECARGOS_FTEING", 4501010101)
+      uma_ref = (
+        datetime(int(f["ejercicio"]), 2, 1) if f.get("ejercicio") else (f.get("pagoFrom") or f.get("pagoTo") or datetime.now())
+      )
+      uma_mxn = get_uma_mxn_for_date(uma_ref) or decimal.Decimal("0")
+      columns = [
+        "No. Licencia",
+        "Serie",
+        "Folio",
+        "Fecha",
+        "Nombre",
+        "RFC",
+        "Observaciones",
+        "Domicilio Licencia",
+        "Domicilio Local",
+        "Tipo Establecimiento",
+        "Giro",
+        "Base Licencia Nueva",
+        "Base Licencia Renovación",
+        "Base Basura Nueva",
+        "Tipo",
+        "Tarifa Licencia",
+        "Tarifa Basura",
+        "Licencia",
+        "Lic Renovación",
+        "Basura",
+        "Actualizaciones",
+        "Recargos",
+        "Otros",
+        "Total",
+      ]
+      sql_params = (
+        cve_fte_mt,
+        f["pagoFrom"],
+        f["pagoTo"],
+        f["tipo"],
+        f["licenciaId"],
+        f["licenciaFrom"],
+        f["licenciaTo"],
+        licencia_principal,
+        actualizaciones_fteing,
+        recargos_fteing,
+        f["ejercicio"],
+        uma_mxn,
+        max_rows,
+      )
+      row_count = _write_csv_file(_LIC_FUNC_CSV, sql_params, columns, out_path)
+    elif kind == "saneamiento_ambiental_csv":
+      cve_fte_mt = str(params.get("cveFteMT") or "MTULUM")
+      f = _saneamiento_ambiental_filters(dict(params))
+      max_rows_raw = params.get("maxRows")
+      max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
+      max_rows = max(1, min(200000, max_rows))
+      def parse_int_env(name: str, default: int) -> int:
+        raw = os.getenv(name)
+        if raw in (None, "", "null"):
+          return default
+        try:
+          return int(str(raw).strip())
+        except Exception:
+          return default
+      derecho_fteing = parse_int_env("SAN_AMB_DERECHO_FTEING", 4326010110)
+      actualizaciones_fteing = parse_int_env("SAN_AMB_ACTUALIZACION_FTEING", 4326010111)
+      recargos_fteing = parse_int_env("SAN_AMB_RECARGOS_FTEING", 4501012601)
+      columns = [
+        "Padrón",
+        "No. Licencia",
+        "Serie",
+        "Folio",
+        "Fecha",
+        "Nombre",
+        "RFC",
+        "Observaciones",
+        "Domicilio Licencia",
+        "Domicilio Local",
+        "Giro",
+        "No. Cuartos",
+        "Periodo pagado",
+        "Derecho",
+        "Actualizaciones",
+        "Recargos",
+        "Total",
+      ]
+      sql_params = (
+        cve_fte_mt,
+        f["pagoFrom"],
+        f["pagoTo"],
+        f["licenciaId"],
+        derecho_fteing,
+        actualizaciones_fteing,
+        recargos_fteing,
+        max_rows,
+      )
+      row_count = _write_csv_file(_SAN_AMB_EXPORT_SELECT, sql_params, columns, out_path)
+    else:
+      raise Exception("Tipo de reporte no soportado")
+
+    _update_report_job(job_id, "done", finished=True, row_count=int(row_count))
+  except Exception as e:
+    try:
+      if out_path.exists():
+        try:
+          os.remove(out_path)
+        except Exception:
+          pass
+    except Exception:
+      pass
+    _update_report_job(job_id, "failed", finished=True, error=str(e))
+
+
+def _start_report_job(job_id: str) -> None:
+  t = threading.Thread(target=_run_report_job, args=(job_id,), daemon=True)
+  t.start()
+
+
+@app.post("/api/reportes/jobs")
+async def create_report_job(request: Request) -> ORJSONResponse:
+  _reject_if_too_large(request, 131072)
+  user = _require_login(request)
+  try:
+    payload = await request.json()
+  except Exception:
+    payload = {}
+  kind = str((payload or {}).get("kind") or "").strip()
+  params = (payload or {}).get("params")
+  if not kind:
+    raise HTTPException(status_code=400, detail="kind requerido")
+  if params is None:
+    params = {}
+  if not isinstance(params, dict):
+    raise HTTPException(status_code=400, detail="params inválido")
+  info = _create_report_job(kind, params, user)
+  _start_report_job(str(info.get("jobId")))
+  job_id = str(info.get("jobId"))
+  return ORJSONResponse(
+    {
+      "ok": True,
+      "job": info,
+      "urls": {
+        "status": f"/api/reportes/jobs/{job_id}",
+        "download": f"/api/reportes/jobs/{job_id}/download",
+      },
+    }
+  )
+
+
+@app.get("/api/reportes/jobs/{job_id}")
+def get_report_job(job_id: str, request: Request) -> ORJSONResponse:
+  _require_login(request)
+  job = _get_report_job(job_id)
+  if not job:
+    raise HTTPException(status_code=404, detail="Job no encontrado")
+  return ORJSONResponse({"ok": True, "job": job})
+
+
+@app.get("/api/reportes/jobs/{job_id}/download")
+def download_report_job(job_id: str, request: Request) -> StreamingResponse:
+  _require_login(request)
+  job = _get_report_job(job_id)
+  if not job:
+    raise HTTPException(status_code=404, detail="Job no encontrado")
+  status = str(job.get("status") or "").lower()
+  if status != "done":
+    raise HTTPException(status_code=409, detail="El job no está listo")
+  p = _report_job_file_path(job_id, "csv")
+  if not p.exists() or not p.is_file():
+    raise HTTPException(status_code=404, detail="Archivo no encontrado")
+  filename = str(job.get("fileName") or f"{job_id}.csv")
+  headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+  def gen() -> Iterable[bytes]:
+    with open(p, "rb") as f:
+      while True:
+        chunk = f.read(1024 * 128)
+        if not chunk:
+          break
+        yield chunk
+  return StreamingResponse(gen(), media_type="text/csv; charset=utf-8", headers=headers)
+
+
+def _prediales_sabana_filters(params: Dict[str, Any]) -> Dict[str, Any]:
+  cve_fte_mt = str(params.get("cveFteMT") or "MTULUM")
+  q = (params.get("q") or "").strip()
+  clave_catastral = (params.get("claveCatastral") or "").strip()
+  clave_mode_raw = (params.get("claveMode") or params.get("claveCatastralMode") or "").strip().lower()
+  if clave_mode_raw in {"exacto", "exacta", "exact"}:
+    clave_mode = "exacto"
+  else:
+    clave_mode = "contiene"
+
+  predio_id_raw = params.get("predioId") or params.get("padron")
+  propietario = (params.get("propietario") or "").strip()
+  apellido_paterno = (params.get("apellidoPaterno") or "").strip()
+  apellido_materno = (params.get("apellidoMaterno") or "").strip()
+  nombre = (params.get("nombre") or "").strip()
+  calle = (params.get("calle") or "").strip()
+  numero = (params.get("numero") or "").strip()
+  estatus = (params.get("estatus") or "").strip()
+  adeudo_raw = (params.get("adeudo") or "").strip().lower()
+  adeudo = adeudo_raw if adeudo_raw in {"todos", "con", "sin"} else ""
+
+  from_alta = _parse_date(params.get("fromAlta"))
+  to_alta = _parse_date(params.get("toAlta"))
+
+  max_rows_raw = params.get("maxRows")
+  max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
+  max_rows = max(1, min(200000, max_rows))
+
+  def to_int(value: Any) -> Optional[int]:
+    if value in (None, "", "null"):
+      return None
+    s = str(value).strip()
+    if not s:
+      return None
+    if s.isdigit():
+      try:
+        return int(s)
+      except Exception:
+        return None
+    try:
+      return int(float(s))
+    except Exception:
+      return None
+
+  predio_id = to_int(predio_id_raw)
+  ejercicio_actual = datetime.now().year
+
+  columns = [
+    "Padrón",
+    "Clave Catastral",
+    "Fecha de Alta del Predio",
+    "Calle",
+    "Código Postal",
+    "Número",
+    "Propietario",
+    "Estatus",
+    "Datos escriturales",
+    "Superficie del Terreno",
+    "Valor del Terreno",
+    "Área Construida",
+    "Valor de Construcción",
+    "Valor Catastral",
+    "Año del valor catastral",
+    "Impuesto Actual",
+    "Impuesto por bimestre",
+    "Ut.Bim.Pagado",
+    "Tipo de Predio",
+    "Estado Físico",
+    "Ejer - Per",
+  ]
+
+  sql_params = (
+    cve_fte_mt,
+    q or None,
+    clave_catastral or None,
+    clave_mode,
+    predio_id,
+    propietario or None,
+    apellido_paterno or None,
+    apellido_materno or None,
+    nombre or None,
+    calle or None,
+    numero or None,
+    estatus or None,
+    adeudo or None,
+    from_alta,
+    to_alta,
+    ejercicio_actual,
+    max_rows,
+  )
+
+  return {
+    "cveFteMT": cve_fte_mt,
+    "q": q,
+    "claveCatastral": clave_catastral,
+    "claveMode": clave_mode,
+    "predioId": predio_id,
+    "propietario": propietario,
+    "apellidoPaterno": apellido_paterno,
+    "apellidoMaterno": apellido_materno,
+    "nombre": nombre,
+    "calle": calle,
+    "numero": numero,
+    "estatus": estatus,
+    "adeudo": adeudo or "todos",
+    "fromAlta": params.get("fromAlta") or None,
+    "toAlta": params.get("toAlta") or None,
+    "maxRows": max_rows,
+    "columns": columns,
+    "sqlParams": sql_params,
+  }
  
  
 _SABANA_PREDIALES_SELECT = """
@@ -4365,75 +5141,43 @@ def sabana_prediales(request: Request) -> ORJSONResponse:
  
  
 @app.get("/api/reportes/prediales/sabana.csv")
-def sabana_prediales_csv(request: Request) -> StreamingResponse:
-  cve_fte_mt = str(request.query_params.get("cveFteMT") or "MTULUM")
-  q = (request.query_params.get("q") or "").strip()
-  clave_catastral = (request.query_params.get("claveCatastral") or "").strip()
-  clave_mode_raw = (request.query_params.get("claveMode") or request.query_params.get("claveCatastralMode") or "").strip().lower()
-  if clave_mode_raw in {"exacto", "exacta", "exact"}:
-    clave_mode = "exacto"
-  else:
-    clave_mode = "contiene"
+def sabana_prediales_csv(request: Request) -> Any:
+  params = dict(request.query_params)
+  p = _prediales_sabana_filters(params)
+  if _boolish(request.query_params.get("async"), False) and int(p.get("maxRows") or 0) >= int(_REPORT_ASYNC_THRESHOLD_ROWS):
+    user = _require_login(request)
+    info = _create_report_job("prediales_sabana_csv", params, user)
+    _start_report_job(str(info.get("jobId")))
+    job_id = str(info.get("jobId"))
+    return ORJSONResponse(
+      {
+        "ok": True,
+        "async": True,
+        "job": info,
+        "urls": {"status": f"/api/reportes/jobs/{job_id}", "download": f"/api/reportes/jobs/{job_id}/download"},
+      }
+    )
 
-  predio_id_raw = request.query_params.get("predioId") or request.query_params.get("padron")
-  propietario = (request.query_params.get("propietario") or "").strip()
-  apellido_paterno = (request.query_params.get("apellidoPaterno") or "").strip()
-  apellido_materno = (request.query_params.get("apellidoMaterno") or "").strip()
-  nombre = (request.query_params.get("nombre") or "").strip()
-  calle = (request.query_params.get("calle") or "").strip()
-  numero = (request.query_params.get("numero") or "").strip()
-  estatus = (request.query_params.get("estatus") or "").strip()
-  adeudo_raw = (request.query_params.get("adeudo") or "").strip().lower()
-  adeudo = adeudo_raw if adeudo_raw in {"todos", "con", "sin"} else ""
+  cve_fte_mt = str(p.get("cveFteMT") or "MTULUM")
+  q = str(p.get("q") or "")
+  clave_catastral = str(p.get("claveCatastral") or "")
+  clave_mode = str(p.get("claveMode") or "contiene")
+  predio_id = p.get("predioId")
+  propietario = str(p.get("propietario") or "")
+  apellido_paterno = str(p.get("apellidoPaterno") or "")
+  apellido_materno = str(p.get("apellidoMaterno") or "")
+  nombre = str(p.get("nombre") or "")
+  calle = str(p.get("calle") or "")
+  numero = str(p.get("numero") or "")
+  estatus = str(p.get("estatus") or "")
+  adeudo = str(p.get("adeudo") or "").strip().lower()
+  if adeudo == "todos":
+    adeudo = ""
 
-  from_alta = _parse_date(request.query_params.get("fromAlta"))
-  to_alta = _parse_date(request.query_params.get("toAlta"))
- 
-  max_rows_raw = request.query_params.get("maxRows")
-  max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
-  max_rows = max(1, min(200000, max_rows))
- 
-  columns = [
-    "Padrón",
-    "Clave Catastral",
-    "Fecha de Alta del Predio",
-    "Calle",
-    "Código Postal",
-    "Número",
-    "Propietario",
-    "Estatus",
-    "Datos escriturales",
-    "Superficie del Terreno",
-    "Valor del Terreno",
-    "Área Construida",
-    "Valor de Construcción",
-    "Valor Catastral",
-    "Año del valor catastral",
-    "Impuesto Actual",
-    "Impuesto por bimestre",
-    "Ut.Bim.Pagado",
-    "Tipo de Predio",
-    "Estado Físico",
-    "Ejer - Per",
-  ]
- 
-  def to_int(value: Any) -> Optional[int]:
-    if value in (None, "", "null"):
-      return None
-    s = str(value).strip()
-    if not s:
-      return None
-    if s.isdigit():
-      try:
-        return int(s)
-      except Exception:
-        return None
-    try:
-      return int(float(s))
-    except Exception:
-      return None
-
-  predio_id = to_int(predio_id_raw)
+  from_alta = _parse_date(p.get("fromAlta"))
+  to_alta = _parse_date(p.get("toAlta"))
+  max_rows = int(p.get("maxRows") or 50000)
+  columns = p.get("columns") or []
   ejercicio_actual = datetime.now().year
 
   def gen() -> Iterable[bytes]:
@@ -5567,7 +6311,24 @@ def sabana_pagos(request: Request) -> ORJSONResponse:
  
  
 @app.get("/api/reportes/prediales/sabana-pagos.csv")
-def sabana_pagos_csv(request: Request) -> StreamingResponse:
+def sabana_pagos_csv(request: Request) -> Any:
+  if _boolish(request.query_params.get("async"), False):
+    max_rows_raw = request.query_params.get("maxRows")
+    max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
+    if max_rows >= int(_REPORT_ASYNC_THRESHOLD_ROWS):
+      user = _require_login(request)
+      params = dict(request.query_params)
+      info = _create_report_job("prediales_sabana_pagos_csv", params, user)
+      _start_report_job(str(info.get("jobId")))
+      job_id = str(info.get("jobId"))
+      return ORJSONResponse(
+        {
+          "ok": True,
+          "async": True,
+          "job": info,
+          "urls": {"status": f"/api/reportes/jobs/{job_id}", "download": f"/api/reportes/jobs/{job_id}/download"},
+        }
+      )
   cve_fte_mt = str(request.query_params.get("cveFteMT") or "MTULUM")
   f = _prediales_pagos_filters(dict(request.query_params))
  
@@ -7119,13 +7880,27 @@ def analitica_saneamiento_ambiental_pronostico(request: Request) -> ORJSONRespon
 
 
 @app.get("/api/reportes/saneamiento/ambiental.csv")
-def saneamiento_ambiental_csv(request: Request) -> StreamingResponse:
+def saneamiento_ambiental_csv(request: Request) -> Any:
   cve_fte_mt = str(request.query_params.get("cveFteMT") or "MTULUM")
   f = _saneamiento_ambiental_filters(dict(request.query_params))
 
   max_rows_raw = request.query_params.get("maxRows")
   max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
   max_rows = max(1, min(200000, max_rows))
+  if _boolish(request.query_params.get("async"), False) and max_rows >= int(_REPORT_ASYNC_THRESHOLD_ROWS):
+    user = _require_login(request)
+    params = dict(request.query_params)
+    info = _create_report_job("saneamiento_ambiental_csv", params, user)
+    _start_report_job(str(info.get("jobId")))
+    job_id = str(info.get("jobId"))
+    return ORJSONResponse(
+      {
+        "ok": True,
+        "async": True,
+        "job": info,
+        "urls": {"status": f"/api/reportes/jobs/{job_id}", "download": f"/api/reportes/jobs/{job_id}/download"},
+      }
+    )
 
   def parse_int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -7419,13 +8194,27 @@ def saneamiento_ambiental_xlsx(request: Request) -> StreamingResponse:
 
 
 @app.get("/api/reportes/licencias/funcionamiento.csv")
-def licencias_funcionamiento_csv(request: Request) -> StreamingResponse:
+def licencias_funcionamiento_csv(request: Request) -> Any:
   cve_fte_mt = str(request.query_params.get("cveFteMT") or "MTULUM")
   f = _licencias_func_filters(dict(request.query_params))
 
   max_rows_raw = request.query_params.get("maxRows")
   max_rows = int(max_rows_raw) if max_rows_raw and str(max_rows_raw).isdigit() else 50000
   max_rows = max(1, min(200000, max_rows))
+  if _boolish(request.query_params.get("async"), False) and max_rows >= int(_REPORT_ASYNC_THRESHOLD_ROWS):
+    user = _require_login(request)
+    params = dict(request.query_params)
+    info = _create_report_job("licencias_funcionamiento_csv", params, user)
+    _start_report_job(str(info.get("jobId")))
+    job_id = str(info.get("jobId"))
+    return ORJSONResponse(
+      {
+        "ok": True,
+        "async": True,
+        "job": info,
+        "urls": {"status": f"/api/reportes/jobs/{job_id}", "download": f"/api/reportes/jobs/{job_id}/download"},
+      }
+    )
 
   def parse_int_env(name: str, default: Optional[int] = None) -> Optional[int]:
     raw = os.getenv(name)
