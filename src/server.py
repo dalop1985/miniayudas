@@ -778,6 +778,318 @@ def _ensure_auth_schema_microservicios() -> None:
     conn.close()
 
 
+def _ensure_licencias_schema_microservicios() -> None:
+  _ensure_auth_schema_microservicios()
+  ddl: List[str] = []
+  ddl.append(
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'licencias')
+    BEGIN
+      EXEC('CREATE SCHEMA licencias');
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.cat_tipo_licencia', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.cat_tipo_licencia (
+        id_tipo_licencia     INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_cat_tipo PRIMARY KEY,
+        clave                VARCHAR(20) NOT NULL,
+        nombre               VARCHAR(200) NOT NULL,
+        descripcion          VARCHAR(500) NULL,
+        requiere_pc          BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_requiere_pc DEFAULT (0),
+        requiere_dsa         BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_requiere_dsa DEFAULT (0),
+        requiere_du          BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_requiere_du DEFAULT (0),
+        requiere_zofemat     BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_requiere_zofemat DEFAULT (0),
+        es_bebida_alcoholica BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_es_baa DEFAULT (0),
+        activo               BIT NOT NULL CONSTRAINT DF_lic_cat_tipo_activo DEFAULT (1),
+        fecha_creacion       DATETIME2(0) NOT NULL CONSTRAINT DF_lic_cat_tipo_fc DEFAULT (SYSUTCDATETIME()),
+        fecha_modificacion   DATETIME2(0) NULL,
+        CONSTRAINT UQ_lic_cat_tipo_clave UNIQUE (clave)
+      );
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.cat_giro', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.cat_giro (
+        id_giro              INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_cat_giro PRIMARY KEY,
+        id_tipo_licencia     INT NOT NULL,
+        clave_giro           VARCHAR(30) NOT NULL,
+        nombre_giro          VARCHAR(300) NOT NULL,
+        descripcion          VARCHAR(500) NULL,
+        nivel_riesgo         VARCHAR(20) NULL,
+        categoria_scian      VARCHAR(10) NULL,
+        activo               BIT NOT NULL CONSTRAINT DF_lic_cat_giro_activo DEFAULT (1),
+        observaciones        VARCHAR(1000) NULL,
+        CONSTRAINT UQ_lic_cat_giro_clave UNIQUE (clave_giro),
+        CONSTRAINT FK_lic_cat_giro_tipo FOREIGN KEY (id_tipo_licencia) REFERENCES licencias.cat_tipo_licencia(id_tipo_licencia)
+      );
+      CREATE INDEX IX_lic_cat_giro_tipo ON licencias.cat_giro(id_tipo_licencia);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.cat_tarifa_giro', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.cat_tarifa_giro (
+        id_tarifa            INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_cat_tarifa PRIMARY KEY,
+        id_giro              INT NOT NULL,
+        ejercicio_fiscal     INT NOT NULL,
+        tarifa_uma_anual     DECIMAL(10,4) NOT NULL,
+        tarifa_mxn_calculada DECIMAL(12,2) NULL,
+        valor_uma_aplicado   DECIMAL(10,4) NULL,
+        aplica_desde         DATE NULL,
+        aplica_hasta         DATE NULL,
+        fundamento_legal     VARCHAR(500) NULL,
+        activo               BIT NOT NULL CONSTRAINT DF_lic_cat_tarifa_activo DEFAULT (1),
+        CONSTRAINT FK_lic_cat_tarifa_giro FOREIGN KEY (id_giro) REFERENCES licencias.cat_giro(id_giro)
+      );
+      CREATE INDEX IX_lic_cat_tarifa_giro_ej ON licencias.cat_tarifa_giro(id_giro, ejercicio_fiscal);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.licencia_funcionamiento', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.licencia_funcionamiento (
+        id_licencia              BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_licencia PRIMARY KEY,
+        folio                    VARCHAR(30) NOT NULL,
+        id_tipo_licencia         INT NOT NULL,
+        id_giro                  INT NOT NULL,
+        razon_social             VARCHAR(500) NOT NULL,
+        nombre_comercial         VARCHAR(500) NULL,
+        rfc                      VARCHAR(15) NULL,
+        domicilio_fiscal         VARCHAR(500) NULL,
+        domicilio_establecimiento VARCHAR(500) NULL,
+        telefono                 VARCHAR(20) NULL,
+        email                    VARCHAR(200) NULL,
+        aforo_personas           INT NULL,
+        metros_cuadrados         DECIMAL(10,2) NULL,
+        estado_licencia          VARCHAR(30) NOT NULL,
+        ejercicio_fiscal         INT NOT NULL,
+        fecha_solicitud          DATETIME2(0) NOT NULL,
+        fecha_emision            DATETIME2(0) NULL,
+        fecha_vencimiento        DATE NULL,
+        id_tarifa                INT NULL,
+        monto_total              DECIMAL(12,2) NULL,
+        monto_pagado             DECIMAL(12,2) NOT NULL CONSTRAINT DF_lic_monto_pagado DEFAULT (0),
+        es_nueva                 BIT NOT NULL CONSTRAINT DF_lic_es_nueva DEFAULT (1),
+        observaciones            VARCHAR(2000) NULL,
+        fecha_creacion           DATETIME2(0) NOT NULL CONSTRAINT DF_lic_fc DEFAULT (SYSUTCDATETIME()),
+        fecha_modificacion       DATETIME2(0) NULL,
+        activo                   BIT NOT NULL CONSTRAINT DF_lic_activo DEFAULT (1),
+        CONSTRAINT UQ_lic_folio UNIQUE (folio),
+        CONSTRAINT FK_lic_tipo FOREIGN KEY (id_tipo_licencia) REFERENCES licencias.cat_tipo_licencia(id_tipo_licencia),
+        CONSTRAINT FK_lic_giro FOREIGN KEY (id_giro) REFERENCES licencias.cat_giro(id_giro),
+        CONSTRAINT FK_lic_tarifa FOREIGN KEY (id_tarifa) REFERENCES licencias.cat_tarifa_giro(id_tarifa)
+      );
+      CREATE INDEX IX_lic_licencia_rfc ON licencias.licencia_funcionamiento(rfc);
+      CREATE INDEX IX_lic_licencia_estado_ej ON licencias.licencia_funcionamiento(estado_licencia, ejercicio_fiscal);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.historial_estado_licencia', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.historial_estado_licencia (
+        id_historial           BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_hist PRIMARY KEY,
+        id_licencia            BIGINT NOT NULL,
+        estado_anterior        VARCHAR(30) NULL,
+        estado_nuevo           VARCHAR(30) NOT NULL,
+        fecha_cambio           DATETIME2(0) NOT NULL CONSTRAINT DF_lic_hist_fc DEFAULT (SYSUTCDATETIME()),
+        usuario                NVARCHAR(120) NULL,
+        motivo                 VARCHAR(500) NULL,
+        ip_origen              VARCHAR(45) NULL,
+        CONSTRAINT FK_lic_hist_licencia FOREIGN KEY (id_licencia) REFERENCES licencias.licencia_funcionamiento(id_licencia)
+      );
+      CREATE INDEX IX_lic_hist_licencia ON licencias.historial_estado_licencia(id_licencia, fecha_cambio);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.requisito_licencia', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.requisito_licencia (
+        id_requisito           BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_req PRIMARY KEY,
+        id_licencia            BIGINT NOT NULL,
+        tipo_requisito         VARCHAR(50) NOT NULL,
+        descripcion            VARCHAR(300) NULL,
+        cumplido               BIT NOT NULL CONSTRAINT DF_lic_req_cumplido DEFAULT (0),
+        fecha_cumplimiento     DATETIME2(0) NULL,
+        folio_referencia       VARCHAR(100) NULL,
+        microservicio_origen   VARCHAR(50) NULL,
+        observaciones          VARCHAR(500) NULL,
+        usuario_valida         NVARCHAR(120) NULL,
+        CONSTRAINT FK_lic_req_licencia FOREIGN KEY (id_licencia) REFERENCES licencias.licencia_funcionamiento(id_licencia)
+      );
+      CREATE INDEX IX_lic_req_licencia ON licencias.requisito_licencia(id_licencia, tipo_requisito);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF OBJECT_ID('licencias.pago_licencia', 'U') IS NULL
+    BEGIN
+      CREATE TABLE licencias.pago_licencia (
+        id_pago              BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_lic_pago PRIMARY KEY,
+        id_licencia          BIGINT NOT NULL,
+        folio_pago           VARCHAR(50) NOT NULL,
+        monto                DECIMAL(12,2) NOT NULL,
+        fecha_pago           DATETIME2(0) NOT NULL,
+        tipo_pago            VARCHAR(30) NULL,
+        referencia_bancaria  VARCHAR(100) NULL,
+        id_caja              INT NULL,
+        usuario_cajero       NVARCHAR(120) NULL,
+        cancelado            BIT NOT NULL CONSTRAINT DF_lic_pago_cancelado DEFAULT (0),
+        motivo_cancelacion   VARCHAR(300) NULL,
+        fecha_cancelacion    DATETIME2(0) NULL,
+        CONSTRAINT UQ_lic_pago_folio UNIQUE (folio_pago),
+        CONSTRAINT FK_lic_pago_licencia FOREIGN KEY (id_licencia) REFERENCES licencias.licencia_funcionamiento(id_licencia)
+      );
+      CREATE INDEX IX_lic_pago_licencia ON licencias.pago_licencia(id_licencia, fecha_pago);
+    END
+    """
+  )
+  ddl.append(
+    """
+    IF NOT EXISTS (SELECT 1 FROM sys.sequences s INNER JOIN sys.schemas sc ON sc.schema_id = s.schema_id WHERE sc.name='licencias' AND s.name='seq_folio')
+    BEGIN
+      EXEC('CREATE SEQUENCE licencias.seq_folio AS BIGINT START WITH 1 INCREMENT BY 1;');
+    END
+    """
+  )
+
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    for stmt in ddl:
+      cur.execute(stmt)
+    conn.commit()
+
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    cur.execute("SELECT COUNT(1) AS cnt FROM licencias.cat_tipo_licencia;")
+    row = cur.fetchone()
+    cnt = int(row[0]) if row else 0
+    if cnt <= 0:
+      cur.execute(
+        """
+        INSERT INTO licencias.cat_tipo_licencia (clave, nombre, descripcion, requiere_pc, requiere_dsa, requiere_du, requiere_zofemat, es_bebida_alcoholica, activo)
+        VALUES
+          ('LF-GEN', 'Licencia General', 'Giros sin alcohol', 0, 0, 0, 0, 0, 1),
+          ('LF-BAA', 'Bebidas Alcohólicas', 'Giros con venta de alcohol', 1, 0, 0, 0, 1, 1),
+          ('LF-HOSP', 'Hospedaje', 'Giros de hospedaje', 1, 1, 0, 1, 0, 1);
+        """
+      )
+      conn.commit()
+
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    cur.execute("SELECT COUNT(1) AS cnt FROM licencias.cat_giro;")
+    row = cur.fetchone()
+    cnt = int(row[0]) if row else 0
+    if cnt <= 0:
+      cur.execute(
+        """
+        INSERT INTO licencias.cat_giro (id_tipo_licencia, clave_giro, nombre_giro, descripcion, nivel_riesgo, categoria_scian, activo)
+        SELECT t.id_tipo_licencia, v.clave_giro, v.nombre_giro, v.descripcion, v.nivel_riesgo, v.categoria_scian, 1
+        FROM (VALUES
+          ('LF-GEN', 'ALB-REST-01', 'Restaurante sin venta de bebidas alcohólicas', 'Alimentos y bebidas', 'BAJO', '722511'),
+          ('LF-BAA', 'ALB-REST-BA', 'Restaurante con venta de bebidas alcohólicas', 'Alimentos y bebidas', 'MEDIO', '722512'),
+          ('LF-BAA', 'ALB-BAR', 'Bar / Cantina / Centro nocturno', 'Entretenimiento', 'ALTO', '722410'),
+          ('LF-HOSP', 'HOSP-HTL-5E', 'Hotel 5 estrellas / Gran Turismo', 'Hospedaje', 'MEDIO', '721111'),
+          ('LF-HOSP', 'HOSP-HTL-3E', 'Hotel 3 estrellas', 'Hospedaje', 'MEDIO', '721112'),
+          ('LF-HOSP', 'HOSP-HOSTAL', 'Hostal / Casa de huéspedes', 'Hospedaje', 'BAJO', '721191'),
+          ('LF-GEN', 'COM-TIENDA', 'Tienda de abarrotes / miscelánea', 'Comercio', 'BAJO', '461110'),
+          ('LF-GEN', 'SALON-BELLEZA', 'Salón de belleza', 'Salud y belleza', 'BAJO', '812112'),
+          ('LF-GEN', 'GYM', 'Gimnasio', 'Deportes', 'BAJO', '713940'),
+          ('LF-GEN', 'TOUR-OPER', 'Tour operadora', 'Turismo', 'MEDIO', '561520')
+        ) AS v(clave_tipo, clave_giro, nombre_giro, descripcion, nivel_riesgo, categoria_scian)
+        INNER JOIN licencias.cat_tipo_licencia t ON t.clave = v.clave_tipo;
+        """
+      )
+      conn.commit()
+
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    cur.execute("SELECT COUNT(1) AS cnt FROM licencias.cat_tarifa_giro;")
+    row = cur.fetchone()
+    cnt = int(row[0]) if row else 0
+    if cnt <= 0:
+      cur.execute(
+        """
+        INSERT INTO licencias.cat_tarifa_giro (id_giro, ejercicio_fiscal, tarifa_uma_anual, tarifa_mxn_calculada, valor_uma_aplicado, aplica_desde, aplica_hasta, fundamento_legal, activo)
+        SELECT g.id_giro, 2026, v.tarifa_uma_anual, CAST(v.tarifa_uma_anual * 100.00 AS DECIMAL(12,2)), 100.00, '2026-01-01', '2026-12-31', 'Ley de Ingresos 2026', 1
+        FROM (VALUES
+          ('ALB-REST-01', 15.0),
+          ('ALB-REST-BA', 35.0),
+          ('ALB-BAR', 60.0),
+          ('HOSP-HTL-5E', 200.0),
+          ('HOSP-HTL-3E', 120.0),
+          ('HOSP-HOSTAL', 40.0),
+          ('COM-TIENDA', 10.0),
+          ('SALON-BELLEZA', 12.0),
+          ('GYM', 18.0),
+          ('TOUR-OPER', 50.0)
+        ) AS v(clave_giro, tarifa_uma_anual)
+        INNER JOIN licencias.cat_giro g ON g.clave_giro = v.clave_giro;
+        """
+      )
+      conn.commit()
+
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+    cur.execute("SELECT COUNT(1) AS cnt FROM licencias.licencia_funcionamiento;")
+    row = cur.fetchone()
+    cnt = int(row[0]) if row else 0
+    if cnt <= 0:
+      cur.execute(
+        """
+        DECLARE @now DATETIME2(0) = SYSUTCDATETIME();
+        INSERT INTO licencias.licencia_funcionamiento
+          (folio, id_tipo_licencia, id_giro, razon_social, nombre_comercial, rfc, domicilio_fiscal, domicilio_establecimiento, telefono, email,
+           aforo_personas, metros_cuadrados, estado_licencia, ejercicio_fiscal, fecha_solicitud, fecha_vencimiento, id_tarifa, monto_total, es_nueva, observaciones)
+        SELECT
+          CONCAT('LF-2026-', RIGHT(CONCAT('000000', ROW_NUMBER() OVER (ORDER BY g.id_giro)), 6)) AS folio,
+          g.id_tipo_licencia,
+          g.id_giro,
+          CONCAT('EJEMPLO ', g.nombre_giro) AS razon_social,
+          g.nombre_giro AS nombre_comercial,
+          'XAXX010101000' AS rfc,
+          'Tulum, Q. Roo' AS domicilio_fiscal,
+          'Tulum, Q. Roo' AS domicilio_establecimiento,
+          '9990000000' AS telefono,
+          'demo@tulum.gob.mx' AS email,
+          50 AS aforo_personas,
+          100.00 AS metros_cuadrados,
+          'SOLICITUD' AS estado_licencia,
+          2026 AS ejercicio_fiscal,
+          @now AS fecha_solicitud,
+          '2026-12-31' AS fecha_vencimiento,
+          tg.id_tarifa,
+          tg.tarifa_mxn_calculada,
+          1 AS es_nueva,
+          'Seed inicial' AS observaciones
+        FROM licencias.cat_giro g
+        LEFT JOIN licencias.cat_tarifa_giro tg ON tg.id_giro = g.id_giro AND tg.ejercicio_fiscal = 2026 AND tg.activo = 1
+        WHERE g.activo = 1;
+        """
+      )
+      conn.commit()
+
+
 def _audit_auth_event(event: str, username: Optional[str], user_id: Optional[int], request: Request, detail: Optional[str] = None) -> None:
   try:
     _ensure_auth_schema_microservicios()
@@ -1031,7 +1343,7 @@ def _role_allows_api_path(role: str, path: str) -> bool:
     return True
 
   if r == "dir_ingresos":
-    if p.startswith("/api/reportes/") or p.startswith("/api/analitica/") or p.startswith("/api/fuentes"):
+    if p.startswith("/api/reportes/") or p.startswith("/api/analitica/") or p.startswith("/api/fuentes") or p.startswith("/api/licencias"):
       return True
     return False
 
@@ -1524,6 +1836,231 @@ async def auth_admin_reset_password(request: Request, x_admin_key: Optional[str]
   return ORJSONResponse({"ok": True})
 
  
+@app.get("/api/licencias/catalogo")
+def licencias_catalogo(request: Request) -> ORJSONResponse:
+  _require_login(request)
+  _ensure_licencias_schema_microservicios()
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT
+        id_tipo_licencia AS id,
+        clave,
+        nombre,
+        descripcion,
+        requiere_pc,
+        requiere_dsa,
+        requiere_du,
+        requiere_zofemat,
+        es_bebida_alcoholica
+      FROM licencias.cat_tipo_licencia
+      WHERE activo = 1
+      ORDER BY clave ASC;
+      """
+    )
+    tipos = _rows(cur)
+    cur.execute(
+      """
+      SELECT
+        g.id_giro AS id,
+        g.id_tipo_licencia,
+        t.clave AS clave_tipo,
+        g.clave_giro,
+        g.nombre_giro,
+        g.descripcion,
+        g.nivel_riesgo,
+        g.categoria_scian
+      FROM licencias.cat_giro g
+      INNER JOIN licencias.cat_tipo_licencia t ON t.id_tipo_licencia = g.id_tipo_licencia
+      WHERE g.activo = 1
+      ORDER BY g.clave_giro ASC;
+      """
+    )
+    giros = _rows(cur)
+    cur.execute(
+      """
+      SELECT
+        tg.id_tarifa AS id,
+        tg.id_giro,
+        g.clave_giro,
+        tg.ejercicio_fiscal,
+        tg.tarifa_uma_anual,
+        tg.tarifa_mxn_calculada,
+        tg.valor_uma_aplicado,
+        tg.activo
+      FROM licencias.cat_tarifa_giro tg
+      INNER JOIN licencias.cat_giro g ON g.id_giro = tg.id_giro
+      WHERE tg.activo = 1
+      ORDER BY tg.ejercicio_fiscal DESC, g.clave_giro ASC;
+      """
+    )
+    tarifas = _rows(cur)
+    return ORJSONResponse({"ok": True, "tipos": tipos, "giros": giros, "tarifas": tarifas})
+
+
+@app.get("/api/licencias")
+def licencias_list(request: Request, limit: int = 50, offset: int = 0) -> ORJSONResponse:
+  _require_login(request)
+  _ensure_licencias_schema_microservicios()
+  limit_n = int(limit) if int(limit) > 0 else 50
+  limit_n = min(200, limit_n)
+  offset_n = int(offset) if int(offset) >= 0 else 0
+  with get_conn_for_database("MicroServicios") as conn:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT
+        l.id_licencia AS id,
+        l.folio AS folio,
+        l.ejercicio_fiscal AS ejercicio,
+        l.razon_social AS razon_social,
+        l.rfc AS rfc,
+        l.estado_licencia AS estado,
+        l.monto_total AS monto_total,
+        l.monto_pagado AS monto_pagado,
+        l.es_nueva AS es_nueva,
+        l.fecha_solicitud AS fecha_solicitud
+      FROM licencias.licencia_funcionamiento l
+      WHERE l.activo = 1
+      ORDER BY l.id_licencia DESC
+      OFFSET ? ROWS FETCH NEXT ? ROWS ONLY;
+      """,
+      (offset_n, limit_n),
+    )
+    rows = _rows(cur)
+    return ORJSONResponse({"ok": True, "rows": rows, "limit": limit_n, "offset": offset_n})
+
+
+@app.post("/api/licencias")
+async def licencias_create(request: Request) -> ORJSONResponse:
+  user = _require_login(request)
+  _reject_if_too_large(request, 65536)
+  _ensure_licencias_schema_microservicios()
+  body = await request.json()
+
+  ejercicio = int((body or {}).get("ejercicio") or 0)
+  es_nueva = bool((body or {}).get("esNueva", True))
+  id_tipo = int((body or {}).get("idTipoLicencia") or 0)
+  id_giro = int((body or {}).get("idGiro") or 0)
+  razon_social = str((body or {}).get("razonSocial") or "").strip()
+  nombre_comercial = str((body or {}).get("nombreComercial") or "").strip() or None
+  rfc = str((body or {}).get("rfc") or "").strip() or None
+  domicilio_fiscal = str((body or {}).get("domicilioFiscal") or "").strip() or None
+  domicilio_establecimiento = str((body or {}).get("domicilioEstablecimiento") or "").strip() or None
+  telefono = str((body or {}).get("telefono") or "").strip() or None
+  email = str((body or {}).get("email") or "").strip() or None
+  aforo = (body or {}).get("aforoPersonas")
+  metros = (body or {}).get("metrosCuadrados")
+  observaciones = str((body or {}).get("observaciones") or "").strip() or None
+
+  if ejercicio < 2000 or ejercicio > 2200:
+    raise HTTPException(status_code=400, detail="Ejercicio inválido")
+  if id_tipo <= 0 or id_giro <= 0:
+    raise HTTPException(status_code=400, detail="Tipo/Giro inválido")
+  if not razon_social:
+    raise HTTPException(status_code=400, detail="Razón social requerida")
+
+  try:
+    aforo_int = int(aforo) if aforo is not None and str(aforo).strip() != "" else None
+  except Exception:
+    aforo_int = None
+  try:
+    metros_dec = decimal.Decimal(str(metros)) if metros is not None and str(metros).strip() != "" else None
+  except Exception:
+    metros_dec = None
+
+  now = datetime.utcnow()
+  venc = datetime(ejercicio, 12, 31).date()
+
+  conn = get_conn_for_database("MicroServicios")
+  try:
+    cur = conn.cursor()
+    cur.execute("SET NOCOUNT ON; SET XACT_ABORT ON;")
+
+    cur.execute("SELECT NEXT VALUE FOR licencias.seq_folio AS n;")
+    nrow = cur.fetchone()
+    n = int(nrow[0]) if nrow else 0
+    folio = f"LF-{ejercicio}-{n:06d}"
+
+    cur.execute(
+      """
+      SELECT TOP 1 tg.id_tarifa, tg.tarifa_mxn_calculada
+      FROM licencias.cat_tarifa_giro tg
+      WHERE tg.id_giro = ?
+        AND tg.ejercicio_fiscal = ?
+        AND tg.activo = 1
+      ORDER BY tg.id_tarifa DESC;
+      """,
+      (id_giro, ejercicio),
+    )
+    trow = cur.fetchone()
+    id_tarifa = int(trow[0]) if trow and trow[0] is not None else None
+    monto_total = decimal.Decimal(str(trow[1])) if trow and trow[1] is not None else None
+
+    cur.execute(
+      """
+      INSERT INTO licencias.licencia_funcionamiento
+        (folio, id_tipo_licencia, id_giro, razon_social, nombre_comercial, rfc, domicilio_fiscal, domicilio_establecimiento,
+         telefono, email, aforo_personas, metros_cuadrados, estado_licencia, ejercicio_fiscal, fecha_solicitud, fecha_vencimiento,
+         id_tarifa, monto_total, es_nueva, observaciones)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SOLICITUD', ?, ?, ?, ?, ?, ?, ?);
+      """,
+      (
+        folio,
+        id_tipo,
+        id_giro,
+        razon_social,
+        nombre_comercial,
+        rfc,
+        domicilio_fiscal,
+        domicilio_establecimiento,
+        telefono,
+        email,
+        aforo_int,
+        metros_dec,
+        ejercicio,
+        now,
+        venc,
+        id_tarifa,
+        monto_total,
+        1 if es_nueva else 0,
+        observaciones,
+      ),
+    )
+    cur.execute("SELECT CAST(SCOPE_IDENTITY() AS BIGINT) AS id;")
+    id_row = cur.fetchone()
+    new_id = int(id_row[0]) if id_row else 0
+
+    cur.execute(
+      """
+      INSERT INTO licencias.historial_estado_licencia (id_licencia, estado_anterior, estado_nuevo, usuario, motivo, ip_origen)
+      VALUES (?, NULL, 'SOLICITUD', ?, ?, ?);
+      """,
+      (new_id, str(user.get("username") or "")[:120], "creación", (request.client.host if request.client else None)),
+    )
+
+    conn.commit()
+    return ORJSONResponse({"ok": True, "id": new_id, "folio": folio})
+  except HTTPException:
+    try:
+      conn.rollback()
+    except Exception:
+      pass
+    raise
+  except Exception as e:
+    try:
+      conn.rollback()
+    except Exception:
+      pass
+    return ORJSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+  finally:
+    try:
+      conn.close()
+    except Exception:
+      pass
+
+
 @app.get("/api/health")
 def health() -> Dict[str, Any]:
   return {"ok": True}

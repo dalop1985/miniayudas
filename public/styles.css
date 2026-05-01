@@ -430,6 +430,22 @@ body {
   transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
 }
 
+.card-tile-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: rgba(93, 156, 151, 0.12);
+  color: rgba(15, 23, 42, 0.85);
+  margin-bottom: 10px;
+}
+
+.card-tile-icon i {
+  font-size: 18px;
+  line-height: 1;
+}
+
 .card-tile:hover {
   transform: translateY(-1px);
   border-color: rgba(93, 156, 151, 0.35);

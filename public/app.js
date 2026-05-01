@@ -833,6 +833,29 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
   );
   const [ayudasSection, setAyudasSection] = useState("cambio");
   const [pasesCajaSection, setPasesCajaSection] = useState("predial");
+  const [licenciasTab, setLicenciasTab] = useState("captura");
+  const [licenciasCatalog, setLicenciasCatalog] = useState(null);
+  const [licenciasCatalogLoading, setLicenciasCatalogLoading] = useState(false);
+  const [licenciasCatalogError, setLicenciasCatalogError] = useState("");
+  const [licenciasForm, setLicenciasForm] = useState(() => ({
+    ejercicio: String(new Date().getFullYear()),
+    esNueva: true,
+    idTipoLicencia: "",
+    idGiro: "",
+    razonSocial: "",
+    nombreComercial: "",
+    rfc: "",
+    domicilioFiscal: "",
+    domicilioEstablecimiento: "",
+    telefono: "",
+    email: "",
+    aforoPersonas: "",
+    metrosCuadrados: "",
+    observaciones: ""
+  }));
+  const [licenciasRows, setLicenciasRows] = useState([]);
+  const [licenciasLoading, setLicenciasLoading] = useState(false);
+  const [licenciasError, setLicenciasError] = useState("");
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [inspectorTab, setInspectorTab] = useState("conexion");
   const [reportSection, setReportSection] = useState("prediales");
@@ -2265,6 +2288,121 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     }
   }
 
+  async function loadLicenciasCatalog() {
+    setLicenciasCatalogError("");
+    setLicenciasCatalogLoading(true);
+    setOutput("Cargando catálogos de Licencias...");
+    try {
+      const response = await fetch("/api/licencias/catalogo");
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setLicenciasCatalog(null);
+        setLicenciasCatalogError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setLicenciasCatalog(json);
+      setOutput(json);
+    } catch (error) {
+      setLicenciasCatalog(null);
+      setLicenciasCatalogError(error.message || "No se pudo cargar catálogos.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLicenciasCatalogLoading(false);
+    }
+  }
+
+  async function loadLicenciasRows() {
+    setLicenciasError("");
+    setLicenciasLoading(true);
+    setOutput("Cargando licencias...");
+    try {
+      const query = new URLSearchParams({ limit: "50", offset: "0" });
+      const response = await fetch(`/api/licencias?${query.toString()}`);
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setLicenciasRows([]);
+        setLicenciasError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setLicenciasRows(Array.isArray(json.rows) ? json.rows : []);
+      setOutput(json);
+    } catch (error) {
+      setLicenciasRows([]);
+      setLicenciasError(error.message || "No se pudo cargar licencias.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLicenciasLoading(false);
+    }
+  }
+
+  function updateLicenciasFormField(event) {
+    const { name, type } = event.target;
+    const value = type === "checkbox" ? Boolean(event.target.checked) : event.target.value;
+    setLicenciasForm((prev) => ({ ...prev, [name]: value }));
+  }
+
+  async function createLicencia() {
+    setLicenciasError("");
+    const ejercicio = Number(licenciasForm.ejercicio);
+    if (!Number.isFinite(ejercicio) || ejercicio < 2000 || ejercicio > 2200) {
+      setLicenciasError("Ejercicio inválido.");
+      return;
+    }
+    if (!String(licenciasForm.idTipoLicencia || "").trim()) {
+      setLicenciasError("Tipo de licencia requerido.");
+      return;
+    }
+    if (!String(licenciasForm.idGiro || "").trim()) {
+      setLicenciasError("Giro requerido.");
+      return;
+    }
+    if (!String(licenciasForm.razonSocial || "").trim()) {
+      setLicenciasError("Razón social requerida.");
+      return;
+    }
+
+    setLicenciasLoading(true);
+    setOutput("Creando licencia...");
+    try {
+      const payload = {
+        ejercicio,
+        esNueva: Boolean(licenciasForm.esNueva),
+        idTipoLicencia: Number(licenciasForm.idTipoLicencia),
+        idGiro: Number(licenciasForm.idGiro),
+        razonSocial: String(licenciasForm.razonSocial || "").trim(),
+        nombreComercial: String(licenciasForm.nombreComercial || "").trim(),
+        rfc: String(licenciasForm.rfc || "").trim(),
+        domicilioFiscal: String(licenciasForm.domicilioFiscal || "").trim(),
+        domicilioEstablecimiento: String(licenciasForm.domicilioEstablecimiento || "").trim(),
+        telefono: String(licenciasForm.telefono || "").trim(),
+        email: String(licenciasForm.email || "").trim(),
+        aforoPersonas: licenciasForm.aforoPersonas ? Number(licenciasForm.aforoPersonas) : null,
+        metrosCuadrados: licenciasForm.metrosCuadrados ? Number(licenciasForm.metrosCuadrados) : null,
+        observaciones: String(licenciasForm.observaciones || "").trim()
+      };
+      const response = await fetch("/api/licencias", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const json = await response.json().catch(() => null);
+      if (!response.ok || !json?.ok) {
+        setLicenciasError(String(json?.detail || json?.error || `HTTP ${response.status}`));
+        setOutput(json || { ok: false, detail: `HTTP ${response.status}` });
+        return;
+      }
+      setOutput(json);
+      await loadLicenciasRows();
+    } catch (error) {
+      setLicenciasError(error.message || "No se pudo crear.");
+      setOutput({ ok: false, error: error.message });
+    } finally {
+      setLicenciasLoading(false);
+    }
+  }
+
   function updateRecargosField(event) {
     const { name, value } = event.target;
     setRecargosForm((prev) => ({ ...prev, [name]: value }));
@@ -3194,6 +3332,16 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     }
   }, [allowed.join("|"), section]);
 
+  useEffect(() => {
+    if (section !== "licencias") return;
+    if (!licenciasCatalog && !licenciasCatalogLoading) {
+      loadLicenciasCatalog();
+    }
+    if (!licenciasRows.length && !licenciasLoading) {
+      loadLicenciasRows();
+    }
+  }, [section, licenciasCatalog, licenciasCatalogLoading, licenciasRows.length, licenciasLoading]);
+
   function sectionToPath(nextSection) {
     if (nextSection === "inicio") return "/ingresos";
     if (nextSection === "cajas") return "/ingresos/cajas";
@@ -3201,6 +3349,13 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     if (nextSection === "analitica") return "/ingresos/analitica";
     if (nextSection === "padronCatastral") return "/ingresos/padron-catastral";
     if (nextSection === "pasesCaja") return "/ingresos/pases-caja";
+    if (nextSection === "licencias") return "/ingresos/licencias";
+    if (nextSection === "catastro") return "/ingresos/catastro";
+    if (nextSection === "zofemat") return "/ingresos/zofemat";
+    if (nextSection === "saneamiento") return "/ingresos/saneamiento";
+    if (nextSection === "desarrolloUrbano") return "/ingresos/desarrollo-urbano";
+    if (nextSection === "registroCivil") return "/ingresos/registro-civil";
+    if (nextSection === "proteccionCivil") return "/ingresos/proteccion-civil";
     if (nextSection === "config") return "/ingresos/configuracion";
     if (nextSection === "ayudas") return "/ingresos/ayudas";
     return "/ingresos";
@@ -3217,6 +3372,13 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     if (tail === "analitica") return "analitica";
     if (tail === "padron-catastral") return "padronCatastral";
     if (tail === "pases-caja") return "pasesCaja";
+    if (tail === "licencias") return "licencias";
+    if (tail === "catastro") return "catastro";
+    if (tail === "zofemat") return "zofemat";
+    if (tail === "saneamiento") return "saneamiento";
+    if (tail === "desarrollo-urbano") return "desarrolloUrbano";
+    if (tail === "registro-civil") return "registroCivil";
+    if (tail === "proteccion-civil") return "proteccionCivil";
     if (tail === "configuracion") return "config";
     if (tail === "ayudas") return "ayudas";
     return null;
@@ -3252,6 +3414,13 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     if (section === "analitica") return "Analítica";
     if (section === "padronCatastral") return "Padrón Catastral";
     if (section === "pasesCaja") return "Pases de caja";
+    if (section === "licencias") return "Licencias de Funcionamiento";
+    if (section === "catastro") return "Catastro";
+    if (section === "zofemat") return "ZOFEMAT";
+    if (section === "saneamiento") return "Saneamiento";
+    if (section === "desarrolloUrbano") return "Desarrollo Urbano";
+    if (section === "registroCivil") return "Registro Civil";
+    if (section === "proteccionCivil") return "Protección Civil";
     if (section === "config") return "Configuración";
     return "MiniAyudas";
   }, [section]);
@@ -3270,9 +3439,14 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
     return "Saneamiento";
   }, [pasesCajaSection]);
 
-  function CardTile({ title, description, onClick }) {
+  function CardTile({ title, description, onClick, icon }) {
     return (
       <button type="button" className="card-tile" onClick={onClick}>
+        {icon ? (
+          <div className="card-tile-icon" aria-hidden="true">
+            <i className={icon} />
+          </div>
+        ) : null}
         <div className="card-tile-title">{title}</div>
         <div className="card-tile-desc">{description}</div>
         <div className="card-tile-footer">
@@ -3292,6 +3466,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "cajas",
         title: "Cajas",
         description: "Operación de caja y cobro.",
+        icon: "ri-calculator-line",
         onClick: () => navigateSection("cajas")
       });
     }
@@ -3300,6 +3475,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "reportes",
         title: "Reportes",
         description: "Consultas, listados y exportación.",
+        icon: "ri-bar-chart-2-line",
         onClick: () => navigateSection("reportes")
       });
     }
@@ -3308,6 +3484,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "analitica",
         title: "Analítica",
         description: "Indicadores y tableros.",
+        icon: "ri-pie-chart-2-line",
         onClick: () => navigateSection("analitica")
       });
     }
@@ -3316,6 +3493,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "padronCatastral",
         title: "Padrón Catastral",
         description: "Búsqueda y reportes del padrón.",
+        icon: "ri-home-line",
         onClick: () => navigateSection("padronCatastral")
       });
     }
@@ -3324,10 +3502,76 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "pasesCaja",
         title: "Pases de caja",
         description: "Trámites y emisión de pases.",
+        icon: "ri-pass-valid-line",
         onClick: () => {
           navigateSection("pasesCaja");
           setPasesCajaSection("predial");
         }
+      });
+    }
+
+    const dependenciasCards = [];
+    if (allowed.includes("licencias")) {
+      dependenciasCards.push({
+        key: "licencias",
+        title: "Licencias de Funcionamiento",
+        description: "Trámites, requisitos y pagos.",
+        icon: "ri-briefcase-line",
+        onClick: () => navigateSection("licencias")
+      });
+    }
+    if (allowed.includes("catastro")) {
+      dependenciasCards.push({
+        key: "catastro",
+        title: "Catastro",
+        description: "Gestión y consultas catastrales.",
+        icon: "ri-home-fill",
+        onClick: () => navigateSection("catastro")
+      });
+    }
+    if (allowed.includes("zofemat")) {
+      dependenciasCards.push({
+        key: "zofemat",
+        title: "ZOFEMAT",
+        description: "Consultas y trámites de zona federal.",
+        icon: "ri-global-line",
+        onClick: () => navigateSection("zofemat")
+      });
+    }
+    if (allowed.includes("saneamiento")) {
+      dependenciasCards.push({
+        key: "saneamiento",
+        title: "Saneamiento",
+        description: "Validaciones y pagos de saneamiento.",
+        icon: "ri-service-line",
+        onClick: () => navigateSection("saneamiento")
+      });
+    }
+    if (allowed.includes("desarrolloUrbano")) {
+      dependenciasCards.push({
+        key: "desarrolloUrbano",
+        title: "Desarrollo Urbano",
+        description: "Constancias y validaciones.",
+        icon: "ri-window-line",
+        onClick: () => navigateSection("desarrolloUrbano")
+      });
+    }
+    if (allowed.includes("registroCivil")) {
+      dependenciasCards.push({
+        key: "registroCivil",
+        title: "Registro Civil",
+        description: "Trámites y validaciones.",
+        icon: "ri-profile-line",
+        onClick: () => navigateSection("registroCivil")
+      });
+    }
+    if (allowed.includes("proteccionCivil")) {
+      dependenciasCards.push({
+        key: "proteccionCivil",
+        title: "Protección Civil",
+        description: "Dictámenes y verificación.",
+        icon: "ri-flag-line",
+        onClick: () => navigateSection("proteccionCivil")
       });
     }
 
@@ -3337,6 +3581,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "ayudas",
         title: "Ayudas",
         description: "Herramientas y utilidades.",
+        icon: "ri-customer-service-line",
         onClick: () => navigateSection("ayudas")
       });
     }
@@ -3345,6 +3590,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
         key: "config",
         title: "Configuración",
         description: "Parámetros y catálogos.",
+        icon: "ri-mail-settings-line",
         onClick: () => {
           navigateSection("config");
           setConfigSection("umas");
@@ -3375,7 +3621,23 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
             </div>
             <div className="cards-grid">
               {ingresosCards.map((c) => (
-                <CardTile key={c.key} title={c.title} description={c.description} onClick={c.onClick} />
+                <CardTile key={c.key} title={c.title} description={c.description} onClick={c.onClick} icon={c.icon} />
+              ))}
+            </div>
+          </section>
+        ) : null}
+
+        {dependenciasCards.length ? (
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h2>Dependencias</h2>
+                <p>Módulos interdepartamentales.</p>
+              </div>
+            </div>
+            <div className="cards-grid">
+              {dependenciasCards.map((c) => (
+                <CardTile key={c.key} title={c.title} description={c.description} onClick={c.onClick} icon={c.icon} />
               ))}
             </div>
           </section>
@@ -3391,7 +3653,7 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
             </div>
             <div className="cards-grid">
               {adminCards.map((c) => (
-                <CardTile key={c.key} title={c.title} description={c.description} onClick={c.onClick} />
+                <CardTile key={c.key} title={c.title} description={c.description} onClick={c.onClick} icon={c.icon} />
               ))}
             </div>
           </section>
@@ -3985,6 +4247,223 @@ function AdminApp({ user, onLogout, allowedSections, initialSection }) {
                 </div>
               </div>
               <div className="empty">Temporalmente deshabilitado.</div>
+            </section>
+          ) : null}
+
+          {section === "licencias" ? (
+            <div>
+              <section className="panel">
+                <div className="panel-header">
+                  <div>
+                    <h2>Licencias de Funcionamiento</h2>
+                    <p>Captura, consulta y administración.</p>
+                  </div>
+                  <div className="pill">
+                    {licenciasCatalogLoading ? "Cargando catálogo…" : licenciasCatalog ? "Catálogo listo" : "Sin catálogo"}{" "}
+                    {licenciasRows.length ? `| ${licenciasRows.length} licencias` : ""}
+                  </div>
+                </div>
+
+                <section className="tabs tabs-secondary">
+                  <button type="button" className={`tab ${licenciasTab === "captura" ? "active" : ""}`} onClick={() => setLicenciasTab("captura")}>
+                    Captura
+                  </button>
+                  <button type="button" className={`tab ${licenciasTab === "listado" ? "active" : ""}`} onClick={() => setLicenciasTab("listado")}>
+                    Listado
+                  </button>
+                  <button type="button" className={`tab ${licenciasTab === "catalogos" ? "active" : ""}`} onClick={() => setLicenciasTab("catalogos")}>
+                    Catálogos
+                  </button>
+                </section>
+
+                {licenciasCatalogError ? <div className="auth-error" style={{ marginTop: 10 }}>{licenciasCatalogError}</div> : null}
+                {licenciasError ? <div className="auth-error" style={{ marginTop: 10 }}>{licenciasError}</div> : null}
+
+                {licenciasTab === "captura" ? (
+                  <div style={{ marginTop: 12 }}>
+                    <div className="grid">
+                      <Field label="Ejercicio fiscal">
+                        <input name="ejercicio" value={licenciasForm.ejercicio} onChange={updateLicenciasFormField} inputMode="numeric" placeholder="2026" />
+                      </Field>
+                      <Field label="Tipo">
+                        <select name="esNueva" value={licenciasForm.esNueva ? "nueva" : "renovacion"} onChange={(e) => setLicenciasForm((p) => ({ ...p, esNueva: e.target.value === "nueva" }))}>
+                          <option value="nueva">Nueva</option>
+                          <option value="renovacion">Renovación</option>
+                        </select>
+                      </Field>
+                      <Field label="Tipo de licencia">
+                        <select name="idTipoLicencia" value={licenciasForm.idTipoLicencia} onChange={updateLicenciasFormField} disabled={!licenciasCatalog?.tipos?.length}>
+                          <option value="">Selecciona…</option>
+                          {(licenciasCatalog?.tipos || []).map((t) => (
+                            <option key={String(t.id)} value={String(t.id)}>{String(t.clave || "")} — {String(t.nombre || "")}</option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field label="Giro">
+                        <select name="idGiro" value={licenciasForm.idGiro} onChange={updateLicenciasFormField} disabled={!licenciasCatalog?.giros?.length}>
+                          <option value="">Selecciona…</option>
+                          {(licenciasCatalog?.giros || []).map((g) => (
+                            <option key={String(g.id)} value={String(g.id)}>{String(g.clave_giro || "")} — {String(g.nombre_giro || "")}</option>
+                          ))}
+                        </select>
+                      </Field>
+                      <Field className="grid-span-all" label="Razón social *">
+                        <input name="razonSocial" value={licenciasForm.razonSocial} onChange={updateLicenciasFormField} placeholder="Razón social del contribuyente" />
+                      </Field>
+                      <Field className="grid-span-all" label="Nombre comercial">
+                        <input name="nombreComercial" value={licenciasForm.nombreComercial} onChange={updateLicenciasFormField} placeholder="Nombre comercial" />
+                      </Field>
+                      <Field label="RFC">
+                        <input name="rfc" value={licenciasForm.rfc} onChange={updateLicenciasFormField} placeholder="RFC" />
+                      </Field>
+                      <Field label="Teléfono">
+                        <input name="telefono" value={licenciasForm.telefono} onChange={updateLicenciasFormField} placeholder="Teléfono" />
+                      </Field>
+                      <Field label="Email">
+                        <input name="email" value={licenciasForm.email} onChange={updateLicenciasFormField} placeholder="correo@ejemplo.com" />
+                      </Field>
+                      <Field className="grid-span-all" label="Domicilio fiscal">
+                        <input name="domicilioFiscal" value={licenciasForm.domicilioFiscal} onChange={updateLicenciasFormField} placeholder="Domicilio fiscal" />
+                      </Field>
+                      <Field className="grid-span-all" label="Domicilio del establecimiento">
+                        <input name="domicilioEstablecimiento" value={licenciasForm.domicilioEstablecimiento} onChange={updateLicenciasFormField} placeholder="Domicilio del establecimiento" />
+                      </Field>
+                      <Field label="Aforo (personas)">
+                        <input name="aforoPersonas" value={licenciasForm.aforoPersonas} onChange={updateLicenciasFormField} inputMode="numeric" placeholder="0" />
+                      </Field>
+                      <Field label="m²">
+                        <input name="metrosCuadrados" value={licenciasForm.metrosCuadrados} onChange={updateLicenciasFormField} inputMode="decimal" placeholder="0" />
+                      </Field>
+                      <Field className="grid-span-all" label="Observaciones">
+                        <textarea name="observaciones" value={licenciasForm.observaciones} onChange={updateLicenciasFormField} rows={3} placeholder="Notas internas / referencias" />
+                      </Field>
+                    </div>
+                    <div className="actions">
+                      <button className="primary" type="button" onClick={createLicencia} disabled={licenciasLoading}>
+                        {licenciasLoading ? "Guardando..." : "Crear licencia"}
+                      </button>
+                      <button className="ghost" type="button" onClick={loadLicenciasCatalog} disabled={licenciasCatalogLoading}>
+                        {licenciasCatalogLoading ? "Cargando..." : "Recargar catálogos"}
+                      </button>
+                      <button className="ghost" type="button" onClick={loadLicenciasRows} disabled={licenciasLoading}>
+                        {licenciasLoading ? "Cargando..." : "Recargar listado"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                {licenciasTab === "listado" ? (
+                  <div style={{ marginTop: 12 }}>
+                    <TableWithColumns
+                      rows={licenciasRows}
+                      columns={[
+                        { key: "folio", label: "Folio" },
+                        { key: "ejercicio", label: "Ejercicio" },
+                        { key: "razon_social", label: "Razón social" },
+                        { key: "rfc", label: "RFC" },
+                        { key: "estado", label: "Estado" },
+                        { key: "monto_total", label: "Total" }
+                      ]}
+                    />
+                  </div>
+                ) : null}
+
+                {licenciasTab === "catalogos" ? (
+                  <div style={{ marginTop: 12 }}>
+                    <div className="grid">
+                      <div className="kv">
+                        <div className="kv-label">Tipos</div>
+                        <div className="kv-value">{Array.isArray(licenciasCatalog?.tipos) ? licenciasCatalog.tipos.length : 0}</div>
+                      </div>
+                      <div className="kv">
+                        <div className="kv-label">Giros</div>
+                        <div className="kv-value">{Array.isArray(licenciasCatalog?.giros) ? licenciasCatalog.giros.length : 0}</div>
+                      </div>
+                      <div className="kv">
+                        <div className="kv-label">Tarifas</div>
+                        <div className="kv-value">{Array.isArray(licenciasCatalog?.tarifas) ? licenciasCatalog.tarifas.length : 0}</div>
+                      </div>
+                    </div>
+                    <div className="actions">
+                      <button className="ghost" type="button" onClick={loadLicenciasCatalog} disabled={licenciasCatalogLoading}>
+                        {licenciasCatalogLoading ? "Cargando..." : "Recargar catálogos"}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </section>
+            </div>
+          ) : null}
+
+          {section === "catastro" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Catastro</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
+            </section>
+          ) : null}
+
+          {section === "zofemat" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>ZOFEMAT</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
+            </section>
+          ) : null}
+
+          {section === "saneamiento" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Saneamiento</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
+            </section>
+          ) : null}
+
+          {section === "desarrolloUrbano" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Desarrollo Urbano</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
+            </section>
+          ) : null}
+
+          {section === "registroCivil" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Registro Civil</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
+            </section>
+          ) : null}
+
+          {section === "proteccionCivil" ? (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Protección Civil</h2>
+                  <p>Módulo en preparación.</p>
+                </div>
+              </div>
+              <div className="empty">En construcción.</div>
             </section>
           ) : null}
 
@@ -6415,6 +6894,13 @@ function App() {
     if (tail === "analitica") return "analitica";
     if (tail === "padron-catastral") return "padronCatastral";
     if (tail === "pases-caja") return "pasesCaja";
+    if (tail === "licencias") return "licencias";
+    if (tail === "catastro") return "catastro";
+    if (tail === "zofemat") return "zofemat";
+    if (tail === "saneamiento") return "saneamiento";
+    if (tail === "desarrollo-urbano") return "desarrolloUrbano";
+    if (tail === "registro-civil") return "registroCivil";
+    if (tail === "proteccion-civil") return "proteccionCivil";
     if (tail === "configuracion") return "config";
     if (tail === "ayudas") return "ayudas";
     return "__unknown__";
@@ -6447,8 +6933,8 @@ function App() {
     role === "cajero"
       ? ["inicio", "cajas"]
       : role === "dir_ingresos"
-        ? ["inicio", "cajas", "reportes", "analitica", "padronCatastral", "pasesCaja"]
-        : ["inicio", "cajas", "reportes", "analitica", "padronCatastral", "pasesCaja", "ayudas", "config"];
+        ? ["inicio", "cajas", "reportes", "analitica", "padronCatastral", "pasesCaja", "licencias", "catastro", "zofemat", "saneamiento", "desarrolloUrbano", "registroCivil", "proteccionCivil"]
+        : ["inicio", "cajas", "reportes", "analitica", "padronCatastral", "pasesCaja", "licencias", "catastro", "zofemat", "saneamiento", "desarrolloUrbano", "registroCivil", "proteccionCivil", "ayudas", "config"];
 
   if (path === "/401") {
     return <ErrorPage code="401" title="No autenticado" detail="Necesitas iniciar sesión." onGoLogin={() => navigate("/login")} onGoHome={() => navigate("/ingresos")} />;
